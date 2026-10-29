@@ -1,12 +1,10 @@
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-
-const HELPDIRS: &[&str] = &["manual", "command", "policy", "guide", "cpack_gen"];
-const MAXTOKENSPERDOC: usize = 200;
-const MINTOKENSPERDOC: usize = 20;
+use std::rc::Rc;
 
 pub const MAXBAG: usize = 6;
 
@@ -24,45 +22,6 @@ const STOP: &[&str] = &[
     "gotta", "yeah", "okay", "yes", "hello", "hi", "like", "well", "right", "sure", "never", "ever",
 ];
 
-pub fn tokenize(path: &Path, limit: usize) -> Vec<String> {
-    let raw = fs::read_to_string(path).unwrap_or_default().to_lowercase();
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    for c in raw.chars() {
-        if c.is_ascii_alphabetic() || c == '\'' || c == '-' { cur.push(c); }
-        else if !cur.is_empty() { tokens.push(cur.clone()); cur.clear(); if tokens.len() >= limit { break; } }
-    }
-    if !cur.is_empty() && tokens.len() < limit { tokens.push(cur); }
-    tokens
-}
-
-fn collectRst(dir: &Path, out: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() { collectRst(&path, out); }
-            else if path.extension().map(|e| e == "rst").unwrap_or(false) { out.push(path); }
-        }
-    }
-}
-
-pub fn loadDocs() -> HashMap<String, Vec<String>> {
-    let mut docs = HashMap::new();
-    let base = Path::new("data");
-    for dir in HELPDIRS {
-        let p = base.join(dir); if !p.exists() { continue; }
-        let mut paths = Vec::new(); collectRst(&p, &mut paths);
-        for path in paths {
-            let tokens = tokenize(&path, MAXTOKENSPERDOC);
-            if tokens.len() >= MINTOKENSPERDOC {
-                let name = format!("{}/{}", dir, path.file_name().unwrap().to_string_lossy());
-                docs.insert(name, tokens);
-            }
-        }
-    }
-    docs
-}
-
 /// Dialogue tokenizer: keeps punctuation as separate tokens so the model can
 /// learn where a reply ends (".", "?", "!").
 pub fn tokenizeDialogue(text: &str) -> Vec<String> {
@@ -79,56 +38,7 @@ pub fn tokenizeDialogue(text: &str) -> Vec<String> {
     out
 }
 
-pub struct Dialogue { pub turns: Vec<Vec<String>>, pub acts: Vec<u8> }
-
-fn parseDialogues(raw: &str, actsRaw: &[Vec<u8>]) -> Vec<Dialogue> {
-    let mut out = Vec::new();
-    for (i, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
-        let mut turns = Vec::new();
-        let mut turnActs = Vec::new();
-        for (pi, part) in line.split("__eou__").enumerate() {
-            let toks = tokenizeDialogue(part);
-            if toks.is_empty() { continue; }
-            turns.push(toks);
-            turnActs.push(actsRaw.get(i).and_then(|a| a.get(pi)).copied().unwrap_or(1).clamp(1, 4));
-        }
-        if turns.len() < 2 { continue; }
-        out.push(Dialogue { turns, acts: turnActs });
-    }
-    out
-}
-
-fn readActs(path: &Path) -> Vec<Vec<u8>> {
-    fs::read_to_string(path).unwrap_or_default().lines()
-        .map(|l| l.split_whitespace().filter_map(|t| t.parse::<u8>().ok()).collect()).collect()
-}
-
-/// Loads the DailyDialog corpus. Uses the official splits when the zip
-/// archives have been extracted, otherwise a deterministic every-10th
-/// holdout of the full corpus.
-pub fn loadDialogues(root: &Path) -> (Vec<Dialogue>, Vec<Dialogue>) {
-    let officialTrain = root.join("splits/train/train/dialogues_train.txt");
-    let officialTest = root.join("splits/test/test/dialogues_test.txt");
-    if officialTrain.exists() && officialTest.exists() {
-        let train = parseDialogues(
-            &fs::read_to_string(&officialTrain).unwrap_or_default(),
-            &readActs(&root.join("splits/train/train/dialogues_act_train.txt")));
-        let test = parseDialogues(
-            &fs::read_to_string(&officialTest).unwrap_or_default(),
-            &readActs(&root.join("splits/test/test/dialogues_act_test.txt")));
-        return (train, test);
-    }
-    let raw = fs::read_to_string(root.join("dialogues_text.txt")).unwrap_or_default();
-    let acts = readActs(&root.join("dialogues_act.txt"));
-    let all = parseDialogues(&raw, &acts);
-    let mut train = Vec::new();
-    let mut test = Vec::new();
-    for (i, d) in all.into_iter().enumerate() {
-        if i % 10 == 0 { test.push(d); } else { train.push(d); }
-    }
-    (train, test)
-}
+pub struct Dialogue { pub turns: Vec<Vec<String>> }
 
 /// Document frequency over prompts; used to keep only discriminative words of
 /// the user message when it is used as conditioning context.
@@ -212,7 +122,46 @@ pub fn readUbuntuFile(path: &Path) -> Option<Dialogue> {
     }
     if !current.is_empty() { turns.push(current); }
     if turns.len() < 2 { return None; }
-    Some(Dialogue { turns, acts: Vec::new() })
+    Some(Dialogue { turns })
+}
+
+/// Shared progress counters of a streamed corpus.
+#[derive(Clone)]
+pub struct CorpusStatus {
+    pub files: Rc<Cell<u64>>,
+    pub totalFiles: Rc<Cell<u64>>,
+    pub turns: Rc<Cell<u64>>,
+    /// Files that were already done when this chunk started.
+    pub chunkStart: Rc<Cell<u64>>,
+}
+
+impl CorpusStatus {
+    pub fn new() -> CorpusStatus {
+        CorpusStatus {
+            files: Rc::new(Cell::new(0)),
+            totalFiles: Rc::new(Cell::new(0)),
+            turns: Rc::new(Cell::new(0)),
+            chunkStart: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+/// Counts the files of the whole tree without reading them (fast enough for
+/// 1.8 million entries and it gives an exact ETA).
+pub fn countFiles(root: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            if let Ok(files) = fs::read_dir(&path) {
+                for file in files.flatten() {
+                    if file.path().extension().map(|e| e == "tsv").unwrap_or(false) { total += 1; }
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Streaming reader over the whole Ubuntu support log tree.
@@ -223,10 +172,19 @@ pub struct UbuntuDialogs {
     fileIdx: usize,
     pub read: u64,
     pub turns: u64,
+    pub status: CorpusStatus,
+    limit: u64,
+    skip: u64,
 }
 
 impl UbuntuDialogs {
     pub fn new(root: &Path) -> UbuntuDialogs {
+        UbuntuDialogs::withLimit(root, 0, 0)
+    }
+
+    /// `limit` caps the number of files (0 = the whole corpus),
+    /// `skip` ignores the files that were already read in an earlier chunk.
+    pub fn withLimit(root: &Path, limit: u64, skip: u64) -> UbuntuDialogs {
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Ok(entries) = fs::read_dir(root) {
             for entry in entries.flatten() {
@@ -235,7 +193,10 @@ impl UbuntuDialogs {
             }
         }
         dirs.sort();
-        UbuntuDialogs { dirs, dirIdx: 0, files: Vec::new(), fileIdx: 0, read: 0, turns: 0 }
+        let status = CorpusStatus::new();
+        let total = countFiles(root);
+        status.totalFiles.set(if limit > 0 { limit } else { total });
+        UbuntuDialogs { dirs, dirIdx: 0, files: Vec::new(), fileIdx: 0, read: 0, turns: 0, status, limit, skip }
     }
 
     fn loadDir(&mut self) -> bool {
@@ -265,14 +226,22 @@ impl Iterator for UbuntuDialogs {
     type Item = Dialogue;
     fn next(&mut self) -> Option<Dialogue> {
         loop {
+            if self.limit > 0 && self.read >= self.limit { return None; }
             if self.fileIdx >= self.files.len() {
                 if !self.loadDir() { return None; }
             }
             let path = self.files[self.fileIdx].clone();
             self.fileIdx += 1;
             self.read += 1;
+            if self.skip > 0 {
+                self.skip -= 1;
+                self.status.files.set(self.read);
+                continue;
+            }
             if let Some(d) = readUbuntuFile(&path) {
                 self.turns += d.turns.len() as u64;
+                self.status.files.set(self.read);
+                self.status.turns.set(self.turns);
                 return Some(d);
             }
         }
@@ -289,8 +258,14 @@ pub struct SplitDialogs<I> {
 }
 
 impl<I> SplitDialogs<I> {
+    #[allow(dead_code)]
     pub fn new(inner: I, holdEvery: u64, holdCap: usize) -> SplitDialogs<I> {
         SplitDialogs { inner, counter: 0, holdEvery: holdEvery.max(1), holdCap, held: Vec::new() }
+    }
+
+    /// Continues an interrupted run: the holdout pattern stays the same.
+    pub fn at(inner: I, counter: u64, holdEvery: u64, holdCap: usize) -> SplitDialogs<I> {
+        SplitDialogs { inner, counter, holdEvery: holdEvery.max(1), holdCap, held: Vec::new() }
     }
 }
 

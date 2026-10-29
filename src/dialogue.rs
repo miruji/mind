@@ -1,67 +1,29 @@
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use crate::corpus::{tokenizeDialogue, Dialogue, PromptModel};
+use crate::corpus::{tokenizeDialogue, CorpusStatus, Dialogue, PromptModel};
 use crate::mind::{
-    makeWindow, Consciousness, Context, Focus, LinearWork, Subconscious, DLGWINDOW, MODE_ACT,
-    MODE_REPLY, PROPOSALCOUNT,
+    colorForFocus, colorForQuality, hitRate, makeWindow, resetColor, Consciousness, Context, Focus,
+    LinearWork, Subconscious, DLGWINDOW, PROPOSALCOUNT,
 };
 
-/// Dialog act labels used by the act mind (isolated tokens, they never mix
-/// with the ordinary vocabulary of the text mind).
-pub const ACT_LABELS: [&str; 4] = ["act1", "act2", "act3", "act4"];
-/// DailyDialog acts: 1 inform, 2 question, 3 directive, 4 commissive.
-pub const ACT_NAMES: [&str; 4] = ["inform", "question", "directive", "commissive"];
-/// How often the reply training reports its progress.
+/// How often the training reports its progress.
 pub const PROGRESSSTEP: u64 = 20000;
+/// How often the live stream prints its block.
+pub const LIVEBLOCK: u64 = 40;
 
-pub fn actLabel(act: u8) -> &'static str { ACT_LABELS[(act.clamp(1, 4) - 1) as usize] }
-pub fn actNumber(label: &str) -> u8 {
-    for (i, l) in ACT_LABELS.iter().enumerate() { if *l == label { return (i + 1) as u8; } }
-    1
-}
-pub fn actName(act: u8) -> &'static str { ACT_NAMES[(act.clamp(1, 4) - 1) as usize] }
+/// Rolling quality of the live stream: 1.0 for a Top1 hit, 0.5 for a Top3 only
+/// hit, 0.0 for a miss. It drives the green -> red colour of the [ ] block.
+pub struct Quality { ewma: f64, alpha: f64 }
 
-/// Separate mind for the dialog act classifier. It uses the very same
-/// subconscious / consciousness machinery, but keeps its own vocabulary so
-/// act labels can never leak into the reply candidates.
-pub struct ActMind { pub sub: Subconscious, pub cons: Consciousness }
-
-impl ActMind {
-    pub fn new(dialogs: &[Dialogue]) -> ActMind {
-        let mut freq: HashMap<String, u32> = HashMap::new();
-        for l in ACT_LABELS.iter() { freq.insert(l.to_string(), 0); }
-        for d in dialogs {
-            for a in &d.acts { *freq.entry(actLabel(*a).to_string()).or_insert(0) += 1; }
-        }
-        ActMind { sub: Subconscious::new(freq.clone(), None), cons: Consciousness::new(freq) }
+impl Quality {
+    pub fn new(alpha: f64) -> Quality { Quality { ewma: 0.5, alpha } }
+    pub fn observe(&mut self, top1: bool, top3: bool) -> f64 {
+        let s = if top1 { 1.0 } else if top3 { 0.5 } else { 0.0 };
+        self.ewma = (1.0 - self.alpha) * self.ewma + self.alpha * s;
+        self.ewma
     }
-
-    /// Act context: the prompt turn is the window, its content words are the bag.
-    pub fn context(&self, prompt: &[String], promptModel: &PromptModel) -> Context {
-        Context::withBag(makeWindow(prompt, DLGWINDOW), promptModel.bag(prompt), MODE_ACT)
-    }
-
-    /// Predicted act and the raw proposals behind it.
-    pub fn predict(&self, ctx: &Context) -> (u8, Vec<String>) {
-        let props = self.sub.top(ctx, PROPOSALCOUNT);
-        let act = props.first().map(|t| actNumber(t)).unwrap_or(1);
-        (act, props)
-    }
-}
-
-/// Token frequency over a set of dialogues (used to grow the vocabulary of
-/// the mind without touching the statistics collected so far).
-pub fn dialogueFrequency(dialogs: &[Dialogue]) -> HashMap<String, u32> {
-    let mut freq: HashMap<String, u32> = HashMap::new();
-    for d in dialogs {
-        for turn in &d.turns {
-            for t in turn { *freq.entry(t.clone()).or_insert(0) += 1; }
-        }
-    }
-    freq
 }
 
 /// Slide the window by one token.
@@ -73,16 +35,30 @@ fn slide(history: &[String], token: &str) -> Vec<String> {
     h
 }
 
-#[derive(Default)]
-pub struct ActStats { pub steps: u64, pub top1: u64, pub top3: u64, pub surprises: u64, pub wills: u64 }
+#[derive(Default, Clone)]
+pub struct ReplyStats {
+    pub steps: u64, pub top1: u64, pub top3: u64, pub surprises: u64, pub wills: u64,
+    pub turns: u64, pub turnTop1: u64, pub turnTop3: u64,
+    /// How often the true token was reachable at all (it was one of the
+    /// candidates of some feature). This is the ceiling of top1/top3.
+    pub cand: u64,
+    pub candSize: u64,
+}
 
-/// Where the `act:` feature of the reply model comes from.
-#[derive(Clone, Copy, PartialEq)]
-pub enum ActSource {
-    /// The gold act of the corpus (teacher forcing).
-    Gold,
-    /// The act predicted by the act mind (what the chat really uses).
-    Predicted,
+impl ReplyStats {
+    /// Adds the counters of another chunk of the same corpus.
+    pub fn merge(&mut self, other: &ReplyStats) {
+        self.steps += other.steps;
+        self.top1 += other.top1;
+        self.top3 += other.top3;
+        self.surprises += other.surprises;
+        self.wills += other.wills;
+        self.turns += other.turns;
+        self.turnTop1 += other.turnTop1;
+        self.turnTop3 += other.turnTop3;
+        self.cand += other.cand;
+        self.candSize += other.candSize;
+    }
 }
 
 /// Stop conditions of a training run.
@@ -98,62 +74,21 @@ impl Default for TrainLimits {
     fn default() -> TrainLimits { TrainLimits { deadline: None, maxMb: 0 } }
 }
 
-/// Train (or only evaluate) the act classifier.
-pub fn runActs<I, D>(
-    dialogs: I,
-    mind: &mut ActMind,
-    promptModel: &PromptModel,
-    work: &mut LinearWork,
-    focus: &mut Focus,
-    train: bool,
-) -> ActStats
-where I: Iterator<Item = D>, D: Borrow<Dialogue> {
-    let mut st = ActStats::default();
-    for d in dialogs {
-        let d = d.borrow();
-        if d.acts.len() != d.turns.len() { continue; }
-        for i in 1..d.turns.len() {
-            let ctx = mind.context(&d.turns[i - 1], promptModel);
-            let target = actLabel(d.acts[i]);
-            let props = mind.sub.top(&ctx, PROPOSALCOUNT);
-            let hit1 = props.first().map_or(false, |t| t == target);
-            let hit3 = props.iter().any(|t| t == target);
-            st.steps += 1;
-            if hit1 { st.top1 += 1; }
-            if hit3 { st.top3 += 1; }
-            let surprise = !hit3;
-            if surprise { st.surprises += 1; }
-            if train {
-                mind.sub.receiveObservation(&ctx, target);
-                if surprise && work.unit() < focus.probability() {
-                    mind.cons.receiveTrainingTrigger(work, &ctx, &props, target);
-                    if let Some(chosen) = mind.cons.chooseAction(work, &ctx, &props) {
-                        mind.sub.receiveConsciousAction(&ctx, &chosen);
-                        st.wills += 1;
-                    }
-                }
-                focus.onStep(surprise);
-            }
-        }
-    }
-    st
+/// How the beginning of the stage is shown live.
+#[derive(Clone, Copy)]
+pub struct LiveOptions {
+    /// How many tokens are printed one by one (0 = no live output).
+    pub steps: u64,
+    /// Pause between the printed tokens, milliseconds.
+    pub delayMs: u64,
 }
 
-#[derive(Default)]
-pub struct ReplyStats {
-    pub steps: u64, pub top1: u64, pub top3: u64, pub surprises: u64, pub wills: u64,
-    pub turns: u64, pub turnTop1: u64, pub turnTop3: u64,
-    /// How often the true token was reachable at all (it was one of the
-    /// candidates of some feature). This is the ceiling of top1/top3.
-    pub cand: u64,
-    pub candSize: u64,
+impl Default for LiveOptions {
+    fn default() -> LiveOptions { LiveOptions { steps: 0, delayMs: 0 } }
 }
 
-/// Train (or only evaluate) the reply model.
-///
-/// `actSource` selects what the `act:` feature carries: the gold act of the
-/// training corpus (teacher forcing), the act predicted by the act mind (the
-/// honest pipeline that the chat uses) or no act at all.
+/// The one and only training stage: the mind reads the corpus, learns to
+/// continue every message and optionally shows the first steps live.
 pub fn runReplies<I, D>(
     dialogs: I,
     promptModel: &PromptModel,
@@ -161,32 +96,26 @@ pub fn runReplies<I, D>(
     cons: &mut Consciousness,
     work: &mut LinearWork,
     focus: &mut Focus,
-    actMind: &ActMind,
     train: bool,
-    actSource: ActSource,
     limits: TrainLimits,
+    status: Option<&CorpusStatus>,
+    live: LiveOptions,
 ) -> ReplyStats
 where I: Iterator<Item = D>, D: Borrow<Dialogue> {
     let mut st = ReplyStats::default();
     let started = Instant::now();
     let mut nextProgress = PROGRESSSTEP;
     let mut stopped = false;
+    let mut quality = Quality::new(0.12);
     'corpus: for d in dialogs {
         let d = d.borrow();
         for i in 1..d.turns.len() {
             let prompt = &d.turns[i - 1];
             let bag = promptModel.bag(prompt);
-            let act = match actSource {
-                ActSource::Gold => d.acts.get(i).copied().unwrap_or(0),
-                ActSource::Predicted => {
-                    let actCtx = actMind.context(prompt, promptModel);
-                    actMind.predict(&actCtx).0
-                }
-            };
             let mut history = makeWindow(prompt, DLGWINDOW);
             let mut first = true;
             for t in &d.turns[i] {
-                let ctx = Context::withBag(history.clone(), bag.clone(), MODE_REPLY).withAct(act);
+                let ctx = Context::withBag(history.clone(), bag.clone());
                 let (props, cand) = sub.topWithCandidates(&ctx, PROPOSALCOUNT);
                 st.steps += 1;
                 st.candSize += cand.len() as u64;
@@ -215,6 +144,32 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
                     }
                     focus.onStep(surprise);
                 }
+                if st.steps <= live.steps {
+                    let q = quality.observe(hit1, hit3);
+                    let mark = if surprise { "!" } else { "·" };
+                    print!(
+                        "{}{}{}{} ",
+                        colorForFocus(focus.level()),
+                        mark,
+                        t,
+                        resetColor());
+                    if st.steps % LIVEBLOCK == 0 {
+                        print!(
+                            "\n  {}[f={:.2} {} q={:.2} t1={:.1}% t3={:.1}%]{}",
+                            colorForQuality(q),
+                            focus.level(),
+                            if focus.isAwake() { "Y" } else { "n" },
+                            q,
+                            hitRate(st.top1, st.steps),
+                            hitRate(st.top3, st.steps),
+                            resetColor());
+                        println!();
+                        let _ = io::stdout().flush();
+                    }
+                    if live.delayMs > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(live.delayMs));
+                    }
+                }
                 history = slide(&history, t);
             }
             if let Some(dl) = limits.deadline {
@@ -223,14 +178,15 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
         }
         if train && st.steps >= nextProgress {
             println!(
-                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}Mb)",
+                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}Mb){}",
                 st.steps,
-                crate::mind::hitRate(st.top1, st.steps),
-                crate::mind::hitRate(st.top3, st.steps),
-                crate::mind::hitRate(st.cand, st.steps),
+                hitRate(st.top1, st.steps),
+                hitRate(st.top3, st.steps),
+                hitRate(st.cand, st.steps),
                 st.candSize as f64 / st.steps.max(1) as f64,
                 started.elapsed().as_secs_f64(),
-                residentMb());
+                residentMb(),
+                corpusProgress(status, started));
             let _ = io::stdout().flush();
             nextProgress += PROGRESSSTEP;
         }
@@ -252,19 +208,14 @@ pub fn generateReply(
     work: &mut LinearWork,
     focus: &Focus,
     promptModel: &PromptModel,
-    actMind: &ActMind,
     prompt: &[String],
     maxTokens: usize,
-    forcedAct: Option<u8>,
-) -> (String, u8, Vec<String>) {
+) -> String {
     let bag = promptModel.bag(prompt);
-    let actCtx = actMind.context(prompt, promptModel);
-    let (predicted, actProps) = actMind.predict(&actCtx);
-    let act = forcedAct.unwrap_or(predicted);
     let mut history = makeWindow(prompt, DLGWINDOW);
     let mut out = String::new();
     for _ in 0..maxTokens {
-        let ctx = Context::withBag(history.clone(), bag.clone(), MODE_REPLY).withAct(act);
+        let ctx = Context::withBag(history.clone(), bag.clone());
         let props = sub.top(&ctx, PROPOSALCOUNT);
         if props.is_empty() { break; }
         let mut chosen = props[0].clone();
@@ -278,7 +229,7 @@ pub fn generateReply(
         if stop { break; }
         history = slide(&history, &chosen);
     }
-    (out, act, actProps)
+    out
 }
 
 fn isPunctuation(token: &str) -> bool {
@@ -298,6 +249,21 @@ pub fn residentMb() -> u64 {
     0
 }
 
+/// "files 12345/1850268 (0.7%), eta 41m" for the streamed corpus.
+fn corpusProgress(status: Option<&CorpusStatus>, started: Instant) -> String {
+    let status = match status { Some(s) => s, None => return String::new() };
+    let files = status.files.get();
+    let total = status.totalFiles.get();
+    if total == 0 { return String::new(); }
+    let done = files as f64 / total as f64 * 100.0;
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let inChunk = files.saturating_sub(status.chunkStart.get()).max(1);
+    let eta = (total.saturating_sub(files)) as f64 / (inChunk as f64 / elapsed);
+    format!(
+        " | files {}/{} ({:.1}%), eta {:.0}m",
+        files, total, done, eta / 60.0)
+}
+
 /// Interactive chat: the user writes a line, the mind answers on enter.
 pub fn chatLoop(
     sub: &mut Subconscious,
@@ -305,17 +271,15 @@ pub fn chatLoop(
     work: &mut LinearWork,
     focus: &mut Focus,
     promptModel: &PromptModel,
-    actMind: &ActMind,
     maxTokens: usize,
 ) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut lastPrompt: Vec<String> = Vec::new();
-    let mut forcedAct: Option<u8> = None;
     println!();
     println!("=== CHAT ===");
     println!("write a line and press enter - the mind continues with its own reply");
-    println!("commands: /quit  /help  /stats  /act <1-4>  /top");
+    println!("commands: /quit  /help  /stats  /top");
     loop {
         print!("\nyou> ");
         let _ = stdout.flush();
@@ -334,30 +298,15 @@ pub fn chatLoop(
                 "/quit" | "/exit" => { println!("bye"); break; }
                 "/help" => { printHelp(); continue; }
                 "/stats" => { printStats(sub, cons, focus, work); continue; }
-                "/top" => { printTop(sub, cons, promptModel, actMind, &lastPrompt); continue; }
-                "/act" => {
-                    match parts.next().and_then(|v| v.parse::<u8>().ok()) {
-                        Some(a) if (1..=4).contains(&a) => {
-                            forcedAct = Some(a);
-                            println!("act forced: {} ({})", a, actName(a));
-                        }
-                        _ => println!("usage: /act <1-4>"),
-                    }
-                    continue;
-                }
+                "/top" => { printTop(sub, cons, promptModel, &lastPrompt); continue; }
                 other => { println!("unknown command: {}", other); continue; }
             }
         }
         let prompt = tokenizeDialogue(&text);
         if prompt.is_empty() { continue; }
         lastPrompt = prompt.clone();
-        let (reply, act, actProps) = generateReply(
-            sub, cons, work, focus, promptModel, actMind, &prompt, maxTokens, forcedAct);
-        println!(
-            "mind[{}:{}]> {}",
-            actName(act),
-            actProps.first().map(|t| t.to_string()).unwrap_or_default(),
-            reply);
+        let reply = generateReply(sub, cons, work, focus, promptModel, &prompt, maxTokens);
+        println!("mind> {}", reply);
         let _ = stdout.flush();
     }
 }
@@ -367,7 +316,6 @@ fn printHelp() {
     println!("/quit          leave the chat");
     println!("/stats         mind statistics");
     println!("/top           proposals for the last prompt");
-    println!("/act <1-4>     force the dialog act of the reply (inform/question/directive/commissive)");
 }
 
 fn printStats(sub: &Subconscious, cons: &Consciousness, focus: &Focus, work: &LinearWork) {
@@ -380,28 +328,17 @@ fn printStats(sub: &Subconscious, cons: &Consciousness, focus: &Focus, work: &Li
         work.calls(), work.successes(), work.exhausted());
 }
 
-fn printTop(
-    sub: &Subconscious,
-    cons: &Consciousness,
-    promptModel: &PromptModel,
-    actMind: &ActMind,
-    prompt: &[String],
-) {
+fn printTop(sub: &Subconscious, cons: &Consciousness, promptModel: &PromptModel, prompt: &[String]) {
     println!();
     if prompt.is_empty() { println!("(no prompt yet)"); return; }
-    let actCtx = actMind.context(prompt, promptModel);
-    let (act, actProps) = actMind.predict(&actCtx);
-    println!("act   : {} -> {}", actName(act), actProps.join(", "));
     let bag = promptModel.bag(prompt);
     println!("bag   : {}", bag.join(", "));
-    let ctx = Context::withBag(makeWindow(prompt, DLGWINDOW), bag, MODE_REPLY).withAct(act);
+    let ctx = Context::withBag(makeWindow(prompt, DLGWINDOW), bag);
     let props = sub.top(&ctx, 5);
     let subScores = sub.scoreCandidates(&ctx, &props);
     let conScores = cons.scoreCandidates(&ctx, &props, &props);
     println!("reply : {}", props.join(", "));
     for (i, token) in props.iter().enumerate() {
-        let s = subScores[i].1;
-        let c = conScores[i].1;
-        println!("  {:>12}  sub={:.4} con={:.4}", token, s, c);
+        println!("  {:>12}  sub={:.4} con={:.4}", token, subScores[i].1, conScores[i].1);
     }
 }

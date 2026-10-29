@@ -1,22 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
+use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::binio::{readF64, readStr, readU32, readU64, writeF64, writeStr, writeU32, writeU64};
 
 pub const MASK: u64 = u64::MAX;
 pub const P1: f64 = 0.51; // Скорость симуляции, важно чтобы был 0.501 или как можно меньше, но для тестов можно и 0.51 для скорости, точность не падает сильно. но при большей скорости - нужно больше тестов.
 pub const RETRYLIMIT: usize = 3000;
 pub const INCREMENT: f64 = 0.1;
 pub const CAP: f64 = 24.0;
-pub const CONTEXTSIZE: usize = 2;
 pub const PROPOSALCOUNT: usize = 3;
 /// How many entries of a feature row are taken into the candidate set.
 pub const ROWTAKE: usize = 8;
 /// How many continuations of a feature are offered to the conscious choice.
 pub const EDGETAKE: usize = 3;
 pub const BOS: &str = "<BOS>";
-pub const MODE_PLAIN: u8 = 0;
-pub const MODE_ACT: u8 = 1;
-pub const MODE_REPLY: u8 = 2;
 /// Window size used by the dialogue phase.
 pub const DLGWINDOW: usize = 3;
 
@@ -57,20 +56,15 @@ impl LinearWork {
 }
 
 /// Context window. `win` holds the previous tokens ordered oldest -> newest,
-/// `bag` holds discriminative words of the prompt, `mode` selects the phase,
-/// `act` carries the predicted dialog act of the reply (0 = unknown).
+/// `bag` holds the discriminative words of the prompt.
 #[derive(Clone)]
 pub struct Context {
     pub win: Vec<String>,
     pub bag: Vec<String>,
-    pub mode: u8,
-    pub act: u8,
 }
 
 impl Context {
-    pub fn plain(win: Vec<String>) -> Context { Context { win, bag: Vec::new(), mode: MODE_PLAIN, act: 0 } }
-    pub fn withBag(win: Vec<String>, bag: Vec<String>, mode: u8) -> Context { Context { win, bag, mode, act: 0 } }
-    pub fn withAct(mut self, act: u8) -> Context { self.act = act; self }
+    pub fn withBag(win: Vec<String>, bag: Vec<String>) -> Context { Context { win, bag } }
 }
 
 /// Last `size` tokens of `history`, front-padded with <BOS>.
@@ -82,40 +76,24 @@ pub fn makeWindow(history: &[String], size: usize) -> Vec<String> {
     win
 }
 
-/// Same layout as before: window of CONTEXTSIZE tokens ending at `index`.
-pub fn makeContext(tokens: &[String], index: usize) -> Context {
-    Context::plain(makeWindow(&tokens[..index.min(tokens.len())], CONTEXTSIZE))
-}
-
-/// Feature extraction.
-/// With a two token window and MODE_PLAIN this yields exactly the same
-/// features as before (prev / pair / prev2). Everything beyond that is
-/// additive and namespaced so the trained model is not corrupted:
-///   MODE_PLAIN -> "prev:", "pair:", "prev2:"
-///   MODE_ACT   -> "a:..." (isolated, holds dialog acts only)
-///   MODE_REPLY -> shared "prev:"/"pair:" (continuity with the docs corpus)
-///                 plus "bag:", "mode:reply", "act:"
+/// Feature extraction: the window of previous tokens plus the discriminative
+/// words of the prompt. With a two token window this yields exactly the
+/// features of the original engine (prev / pair / prev2); a longer window
+/// adds prev3..prev5.
 pub fn contextFeatures(ctx: &Context) -> Vec<String> {
     let n = ctx.win.len();
-    let mut f = Vec::with_capacity(n + ctx.bag.len() + 3);
-    let pfx: &str = if ctx.mode == MODE_ACT { "a:" } else { "" };
+    let mut f = Vec::with_capacity(n + ctx.bag.len());
     if n >= 1 {
-        f.push(format!("{}prev:{}", pfx, ctx.win[n - 1]));
+        f.push(format!("prev:{}", ctx.win[n - 1]));
         if n >= 2 {
-            f.push(format!("{}pair:{}|{}", pfx, ctx.win[n - 2], ctx.win[n - 1]));
-            if ctx.win[n - 2] != BOS { f.push(format!("{}prev2:{}", pfx, ctx.win[n - 2])); }
+            f.push(format!("pair:{}|{}", ctx.win[n - 2], ctx.win[n - 1]));
+            if ctx.win[n - 2] != BOS { f.push(format!("prev2:{}", ctx.win[n - 2])); }
         }
         for d in 3..=5 {
-            if n >= d && ctx.win[n - d] != BOS { f.push(format!("{}prev{}:{}", pfx, d, ctx.win[n - d])); }
+            if n >= d && ctx.win[n - d] != BOS { f.push(format!("prev{}:{}", d, ctx.win[n - d])); }
         }
     }
-    for w in &ctx.bag { f.push(format!("{}bag:{}", pfx, w)); }
-    if ctx.mode == MODE_ACT {
-        f.push("a:mode:act".to_string());
-    } else if ctx.mode == MODE_REPLY {
-        f.push("mode:reply".to_string());
-        if ctx.act != 0 { f.push(format!("act:{}", ctx.act)); }
-    }
+    for w in &ctx.bag { f.push(format!("bag:{}", w)); }
     f
 }
 
@@ -260,6 +238,53 @@ impl Subconscious {
         }
         (self.rows.len(), entries, biggest)
     }
+    /// Writes the whole table to a stream (checkpoint format).
+    pub fn save(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeU64(out, self.globalFreq.len() as u64)?;
+        for (token, count) in &self.globalFreq {
+            writeStr(out, token)?;
+            writeU64(out, *count as u64)?;
+        }
+        writeU64(out, self.rows.len() as u64)?;
+        for (feature, row) in &self.rows {
+            writeStr(out, feature)?;
+            writeF64(out, row.total)?;
+            writeU32(out, row.weights.len() as u32)?;
+            for (token, weight) in &row.weights {
+                writeStr(out, token)?;
+                writeF64(out, *weight)?;
+            }
+        }
+        Ok(())
+    }
+    /// Reads the table back; the derived top-k cache is rebuilt.
+    pub fn load(&mut self, input: &mut dyn Read) -> std::io::Result<()> {
+        self.globalFreq.clear();
+        let tokens = readU64(input)?;
+        for _ in 0..tokens {
+            let token = readStr(input)?;
+            let count = readU64(input)? as u32;
+            self.globalFreq.insert(token, count);
+        }
+        self.rows.clear();
+        let rows = readU64(input)?;
+        for _ in 0..rows {
+            let feature = readStr(input)?;
+            let total = readF64(input)?;
+            let entries = readU32(input)?;
+            let mut row = FeatureRow::new(self.cap);
+            row.total = total;
+            for _ in 0..entries {
+                let token = readStr(input)?;
+                let weight = readF64(input)?;
+                row.weights.insert(token, weight);
+            }
+            row.rebuildTop();
+            self.rows.insert(feature, row);
+        }
+        self.rebuildCommon();
+        Ok(())
+    }
     fn rebuildCommon(&mut self) {
         let mut common: Vec<_> = self.globalFreq.iter().map(|(k, v)| (k.clone(), *v)).collect();
         common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -392,6 +417,57 @@ impl Consciousness {
         }
         (self.edges.len(), edges, biggest)
     }
+    /// Writes the conscious edges to a stream (checkpoint format).
+    pub fn save(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeU64(out, self.globalFreq.len() as u64)?;
+        for (token, count) in &self.globalFreq {
+            writeStr(out, token)?;
+            writeU64(out, *count as u64)?;
+        }
+        writeU64(out, self.edges.len() as u64)?;
+        for (feature, targets) in &self.edges {
+            writeStr(out, feature)?;
+            writeF64(out, *self.totals.get(feature).unwrap_or(&0.0))?;
+            writeU32(out, targets.len() as u32)?;
+            for (target, weight) in targets {
+                writeStr(out, target)?;
+                writeF64(out, *weight)?;
+            }
+        }
+        Ok(())
+    }
+    /// Reads the conscious edges back; the cached best continuations are rebuilt.
+    pub fn load(&mut self, input: &mut dyn Read) -> std::io::Result<()> {
+        self.globalFreq.clear();
+        let tokens = readU64(input)?;
+        for _ in 0..tokens {
+            let token = readStr(input)?;
+            let count = readU64(input)? as u32;
+            self.globalFreq.insert(token, count);
+        }
+        self.edges.clear();
+        self.totals.clear();
+        self.edgeTop.clear();
+        let features = readU64(input)?;
+        for _ in 0..features {
+            let feature = readStr(input)?;
+            let total = readF64(input)?;
+            let entries = readU32(input)?;
+            let mut targets: HashMap<String, f64> = HashMap::with_capacity(entries as usize);
+            for _ in 0..entries {
+                let target = readStr(input)?;
+                let weight = readF64(input)?;
+                targets.insert(target, weight);
+            }
+            self.totals.insert(feature.clone(), total);
+            for (target, weight) in &targets {
+                self.updateEdgeTop(&feature, target, *weight);
+            }
+            self.edges.insert(feature, targets);
+        }
+        self.rebuildCommon();
+        Ok(())
+    }
     fn rebuildCommon(&mut self) {
         let mut common: Vec<_> = self.globalFreq.iter().map(|(k, v)| (k.clone(), *v)).collect();
         common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -477,7 +553,7 @@ mod tests {
         let mut cons = Consciousness::new(freq);
         let mut rng = Rng(777);
         let mut work = LinearWork::new(P1);
-        let ctx = Context::plain(vec!["a".to_string(), "b".to_string()]);
+        let ctx = Context::withBag(vec!["a".to_string(), "b".to_string()], Vec::new());
         for step in 0..300 {
             let proposals = vec![format!("p{}", rng.pick(5))];
             let target = format!("t{}", rng.pick(30));
