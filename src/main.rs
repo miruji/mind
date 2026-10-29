@@ -232,6 +232,7 @@ fn colorForFocus(level: f64) -> String {
     format!("\x1b[38;2;{};{};40m", r, g)
 }
 fn resetColor() -> &'static str { "\x1b[0m" }
+fn hitRate(hits: u64, steps: u64) -> f64 { if steps == 0 { 0.0 } else { hits as f64 / steps as f64 * 100.0 } }
 
 fn tokenize(path: &Path, limit: usize) -> Vec<String> {
     let raw = fs::read_to_string(path).unwrap_or_default().to_lowercase();
@@ -274,6 +275,7 @@ fn main() {
     println!("CORPUS=data; documents={}", docsMap.len());
     println!("Live focus: decay={} gain={} threshold={}", FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD);
     println!("color: red=asleep → green=high focus | · passive  ! surprise  W will");
+    println!("stats: t1/t3 = subconscious Top1/Top3 hit rate on the true next token");
     println!();
 
     let mut names: Vec<String> = docsMap.keys().cloned().collect();
@@ -297,6 +299,9 @@ fn main() {
     let mut stdout = io::stdout();
     let mut surpriseCount = 0u64;
     let mut willCount = 0u64;
+    let mut top1Hits = 0u64;
+    let mut top3Hits = 0u64;
+    let mut scoredSteps = 0u64;
     let total = LIVESTEPS.min(pairs.len() as u64);
 
     println!("--- live stream ({} steps) ---\n", total);
@@ -306,6 +311,9 @@ fn main() {
         let (ctx, target) = &pairs[idx];
         let props = sub.top(ctx, PROPOSALCOUNT);
         let isSurprise = !props.contains(target);
+        scoredSteps += 1;
+        if props.first().map_or(false, |t| t == target) { top1Hits += 1; }
+        if props.contains(target) { top3Hits += 1; }
         sub.receiveObservation(ctx, target);
 
         let mut mark = "·";
@@ -328,7 +336,12 @@ fn main() {
         print!("{}{}{}{} ", col, mark, target, resetColor());
 
         if (step + 1) % 40 == 0 || step + 1 == total {
-            print!("  \x1b[90m[f={:.2} {} avg={:.1}%]\x1b[0m", focus.level, if focus.isAwake(){"Y"}else{"n"}, focus.avgPercent());
+            print!("\n  \x1b[90m[f={:.2} {} avg={:.1}% t1={:.1}% t3={:.1}%]\x1b[0m",
+                focus.level,
+                if focus.isAwake(){"Y"}else{"n"},
+                focus.avgPercent(),
+                hitRate(top1Hits, scoredSteps),
+                hitRate(top3Hits, scoredSteps));
             println!();
             let _ = stdout.flush();
         }
@@ -338,6 +351,9 @@ fn main() {
     println!();
     println!("=== RESULT ===");
     println!("steps={} surprises={} willActions={}", total, surpriseCount, willCount);
+    println!("top1={:.1}% top3={:.1}% (hits {}/{} and {}/{})",
+        hitRate(top1Hits, scoredSteps), hitRate(top3Hits, scoredSteps),
+        top1Hits, scoredSteps, top3Hits, scoredSteps);
     println!("focus final={:.3} fades={} avgConsciousness={:.1}%", focus.level, focus.fades, focus.avgPercent());
     println!("passiveWrites={} consciousWrites={}", sub.passiveWrites, sub.consciousWrites);
     println!("linearWork rate={:.6}", work.successes as f64 / work.calls.max(1) as f64);
