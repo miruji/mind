@@ -3,20 +3,38 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Mask for 64-bit hash.
 const MASK: u64 = u64::MAX;
+/// World speed boundary.
 const P1: f64 = 0.501;
+/// Max retries for linear work.
 const RETRYLIMIT: usize = 5000;
+/// Weight increment.
 const INCREMENT: f64 = 0.1;
+/// Cap for feature row.
 const CAP: f64 = 24.0;
+/// Context size.
 const CONTEXTSIZE: usize = 2;
+/// Proposals count.
 const PROPOSALCOUNT: usize = 3;
-const CYCLES: usize = 4;
+/// Max tokens per doc.
 const MAXTOKENSPERDOC: usize = 200;
+/// Min tokens.
 const MINTOKENSPERDOC: usize = 20;
+/// Docs split.
 const LABELEDDOCS: usize = 12;
 const UNLABELEDDOCS: usize = 12;
 const TESTDOCS: usize = 8;
 const HELPDIRS: &[&str] = &["manual", "command", "policy", "guide", "cpack_gen"];
+
+/// Focus decay per step without surprise.
+const FOCUSDECAY: f64 = 0.04;
+/// Focus gain on surprise / conscious action.
+const FOCUSGAIN: f64 = 0.25;
+/// Below this focus consciousness is off.
+const FOCUSTHRESHOLD: f64 = 0.15;
+/// Max focus.
+const FOCUSMAX: f64 = 1.0;
 
 fn timeToUnit(ns: u64) -> f64 {
     let mut x: u64 = ns.wrapping_add(0x9E3779B97F4A7C15) & MASK;
@@ -125,8 +143,8 @@ struct Subconscious {
     commonTokens: Vec<String>,
     rows: HashMap<String, FeatureRow>,
     cap: Option<f64>,
-    consciousWrites: u64,
     passiveWrites: u64,
+    consciousWrites: u64,
 }
 
 impl Subconscious {
@@ -138,8 +156,8 @@ impl Subconscious {
             commonTokens: common.into_iter().map(|(k, _)| k).collect(),
             rows: HashMap::new(),
             cap,
-            consciousWrites: 0,
             passiveWrites: 0,
+            consciousWrites: 0,
         }
     }
     fn row(&mut self, feature: &str) -> &mut FeatureRow {
@@ -302,6 +320,51 @@ impl Consciousness {
     }
 }
 
+/// Focus state for consciousness.
+struct Focus {
+    level: f64,
+    consciousSteps: u64,
+    subconsciousOnlySteps: u64,
+    lastAwakeStep: u64,
+    fades: u64,
+}
+
+impl Focus {
+    fn new() -> Self {
+        Self {
+            level: 0.6, // start awake
+            consciousSteps: 0,
+            subconsciousOnlySteps: 0,
+            lastAwakeStep: 0,
+            fades: 0,
+        }
+    }
+    fn isAwake(&self) -> bool {
+        self.level >= FOCUSTHRESHOLD
+    }
+    fn onSurprise(&mut self, step: u64) {
+        self.level = (self.level + FOCUSGAIN).min(FOCUSMAX);
+        self.lastAwakeStep = step;
+    }
+    fn onStep(&mut self, step: u64, hadSurprise: bool) {
+        if hadSurprise {
+            self.onSurprise(step);
+            self.consciousSteps += 1;
+        } else {
+            self.level = (self.level - FOCUSDECAY).max(0.0);
+            if self.isAwake() {
+                self.consciousSteps += 1;
+            } else {
+                self.subconsciousOnlySteps += 1;
+            }
+        }
+        // detect fade
+        if self.level < FOCUSTHRESHOLD && self.level + FOCUSDECAY >= FOCUSTHRESHOLD {
+            self.fades += 1;
+        }
+    }
+}
+
 fn tokenize(path: &Path, limit: usize) -> Vec<String> {
     let raw: String = fs::read_to_string(path).unwrap_or_default().to_lowercase();
     let mut tokens: Vec<String> = Vec::new();
@@ -363,72 +426,10 @@ fn contextPairs(docs: &[Vec<String>]) -> Vec<(Context, String)> {
     pairs
 }
 
-fn evaluateSub(sub: &Subconscious, pairs: &[(Context, String)]) -> (f64, f64) {
-    let n: usize = pairs.len().max(1);
-    let mut top1: usize = 0;
-    let mut top3: usize = 0;
-    for (ctx, target) in pairs {
-        let preds: Vec<String> = sub.top(ctx, 3);
-        if preds.first().map(|p| p == target).unwrap_or(false) { top1 += 1; }
-        if preds.iter().any(|p| p == target) { top3 += 1; }
-    }
-    (top1 as f64 / n as f64, top3 as f64 / n as f64)
-}
-
-fn evaluateConscious(sub: &Subconscious, cons: &Consciousness, pairs: &[(Context, String)]) -> (f64, f64) {
-    let n: usize = pairs.len().max(1);
-    let mut top1: usize = 0;
-    let mut top3: usize = 0;
-    for (ctx, target) in pairs {
-        let proposals: Vec<String> = sub.top(ctx, PROPOSALCOUNT);
-        let ranked: Vec<String> = cons.rank(ctx, &proposals, 3);
-        if ranked.first().map(|p| p == target).unwrap_or(false) { top1 += 1; }
-        if ranked.iter().any(|p| p == target) { top3 += 1; }
-    }
-    (top1 as f64 / n as f64, top3 as f64 / n as f64)
-}
-
-
-fn evaluateNgram(train: &[Vec<String>], pairs: &[(Context, String)]) -> (f64, f64) {
-    let mut prevToNext: HashMap<String, HashMap<String, u32>> = HashMap::new();
-    let mut uni: HashMap<String, u32> = HashMap::new();
-    for tokens in train {
-        for i in 0..tokens.len() {
-            *uni.entry(tokens[i].clone()).or_insert(0) += 1;
-            if i >= 1 {
-                *prevToNext.entry(tokens[i-1].clone()).or_default().entry(tokens[i].clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    let mut uniTop: Vec<(String, u32)> = uni.iter().map(|(k,v)| (k.clone(), *v)).collect();
-    uniTop.sort_by(|a, b| b.1.cmp(&a.1));
-    let uni3: Vec<String> = uniTop.iter().take(3).map(|(k,_)| k.clone()).collect();
-    let n: usize = pairs.len().max(1);
-    let mut top1: usize = 0;
-    let mut top3: usize = 0;
-    for (ctx, target) in pairs {
-        let mut preds: Vec<String> = Vec::new();
-        if let Some(m) = prevToNext.get(&ctx[1]) {
-            let mut ranked: Vec<(String, u32)> = m.iter().map(|(t,c)| (t.clone(), *c)).collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            for (t, _) in ranked.into_iter().take(3) {
-                preds.push(t);
-            }
-        }
-        for t in &uni3 {
-            if preds.len() >= 3 { break; }
-            if !preds.contains(t) { preds.push(t.clone()); }
-        }
-        if preds.first().map(|p| p == target).unwrap_or(false) { top1 += 1; }
-        if preds.iter().any(|p| p == target) { top3 += 1; }
-    }
-    (top1 as f64 / n as f64, top3 as f64 / n as f64)
-}
-
 fn main() {
     let docsMap: HashMap<String, Vec<String>> = loadDocs();
-    println!("CORPUS=data sample rst; usable documents={}", docsMap.len());
-    println!("split: labeled={} unlabeled={} test={}; P1={}; cycles={}", LABELEDDOCS, UNLABELEDDOCS, TESTDOCS, P1, CYCLES);
+    println!("CORPUS=data; documents={}", docsMap.len());
+    println!("Focus: decay={FOCUSDECAY} gain={FOCUSGAIN} threshold={FOCUSTHRESHOLD}");
 
     let mut names: Vec<String> = docsMap.keys().cloned().collect();
     names.sort();
@@ -436,21 +437,16 @@ fn main() {
 
     let n: usize = names.len();
     if n == 0 {
-        println!("no documents loaded");
+        println!("no documents");
         return;
     }
     let labeledEnd: usize = LABELEDDOCS.min(n);
     let unlabeledEnd: usize = (LABELEDDOCS + UNLABELEDDOCS).min(n);
     let testEnd: usize = (LABELEDDOCS + UNLABELEDDOCS + TESTDOCS).min(n);
-    let labeledNames: &[String] = &names[..labeledEnd];
-    let unlabeledNames: &[String] = &names[labeledEnd..unlabeledEnd];
-    let testNames: &[String] = &names[unlabeledEnd..testEnd];
+    let labeled: Vec<Vec<String>> = names[..labeledEnd].iter().map(|n| docsMap[n].clone()).collect();
+    let unlabeled: Vec<Vec<String>> = names[labeledEnd..unlabeledEnd].iter().map(|n| docsMap[n].clone()).collect();
+    let test: Vec<Vec<String>> = names[unlabeledEnd..testEnd].iter().map(|n| docsMap[n].clone()).collect();
 
-    let labeled: Vec<Vec<String>> = labeledNames.iter().map(|n| docsMap[n].clone()).collect();
-    let unlabeled: Vec<Vec<String>> = unlabeledNames.iter().map(|n| docsMap[n].clone()).collect();
-    let test: Vec<Vec<String>> = testNames.iter().map(|n| docsMap[n].clone()).collect();
-
-    // train pool for fair controls = labeled + unlabeled (never test)
     let mut trainDocs: Vec<Vec<String>> = labeled.clone();
     trainDocs.extend(unlabeled.clone());
 
@@ -459,76 +455,72 @@ fn main() {
         for t in doc { *freq.entry(t.clone()).or_insert(0) += 1; }
     }
 
-    let testPairs: Vec<(Context, String)> = contextPairs(&test);
-    let labeledPairs: Vec<(Context, String)> = contextPairs(&labeled);
-    let unlabeledPairs: Vec<(Context, String)> = contextPairs(&unlabeled);
     let trainPairs: Vec<(Context, String)> = contextPairs(&trainDocs);
+    let testPairs: Vec<(Context, String)> = contextPairs(&test);
 
-    // unigram
-    let mut common: Vec<(String, u32)> = freq.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    common.sort_by(|a, b| b.1.cmp(&a.1));
-    let top3uni: Vec<String> = common.iter().take(3).map(|(k, _)| k.clone()).collect();
-    let uniTop1: f64 = testPairs.iter().filter(|(_, t)| top3uni.first().map(|u| u == t).unwrap_or(false)).count() as f64 / testPairs.len().max(1) as f64;
-    let uniTop3: f64 = testPairs.iter().filter(|(_, t)| top3uni.iter().any(|u| u == t)).count() as f64 / testPairs.len().max(1) as f64;
-
-    // n-gram baseline (train only)
-    let (ngT1, ngT3): (f64, f64) = evaluateNgram(&trainDocs, &testPairs);
-
-    // direct = perception on train only (fair)
-    let mut direct: Subconscious = Subconscious::new(freq.clone(), Some(CAP));
-    for _ in 0..CYCLES {
-        for (ctx, target) in &trainPairs {
-            direct.receiveObservation(ctx, target);
-        }
-    }
-    let (dirT1, dirT3): (f64, f64) = evaluateSub(&direct, &testPairs);
-
-    // perception only (same as direct now)
-    let (percT1, percT3): (f64, f64) = (dirT1, dirT3);
-
-    // full loop with surprise on train
     let mut work: LinearWork = LinearWork::new(P1);
     let mut sub: Subconscious = Subconscious::new(freq.clone(), Some(CAP));
     let mut cons: Consciousness = Consciousness::new(freq.clone());
+    let mut focus: Focus = Focus::new();
 
-    for _cycle in 0..CYCLES {
-        for (ctx, target) in &trainPairs {
-            let props: Vec<String> = sub.top(ctx, PROPOSALCOUNT);
-            sub.receiveObservation(ctx, target);
-            if !props.contains(target) {
+    println!();
+    println!("=== FOCUS CYCLE (train stream) ===");
+    println!("{:<6} {:<8} {:<8} {:<10} {}", "step", "focus", "awake", "event", "token");
+
+    let reportEvery: usize = (trainPairs.len() / 20).max(1);
+    let mut step: u64 = 0;
+    let mut surpriseCount: u64 = 0;
+    let mut consciousActions: u64 = 0;
+
+    for (ctx, target) in &trainPairs {
+        step += 1;
+        let props: Vec<String> = sub.top(ctx, PROPOSALCOUNT);
+        let isSurprise: bool = !props.contains(target);
+
+        // always perceive
+        sub.receiveObservation(ctx, target);
+
+        let mut event: &str = "passive";
+        if isSurprise {
+            surpriseCount += 1;
+            event = "surprise";
+            if focus.isAwake() {
+                // consciousness can react only while focused
                 cons.receiveTrainingTrigger(&mut work, ctx, &props, target);
                 if let Some(chosen) = cons.chooseAction(&mut work, ctx, &props) {
                     sub.receiveConsciousAction(ctx, &chosen);
+                    consciousActions += 1;
+                    event = "surprise+will";
                 }
+            } else {
+                event = "surprise(asleep)";
             }
+        }
+
+        focus.onStep(step, isSurprise);
+
+        if step == 1 || step as usize % reportEvery == 0 || !focus.isAwake() && focus.level + FOCUSDECAY >= FOCUSTHRESHOLD {
+            let awakeStr = if focus.isAwake() { "YES" } else { "no" };
+            println!("{:<6} {:<8.3} {:<8} {:<10} {}", step, focus.level, awakeStr, event, target);
         }
     }
 
-    let (subT1, subT3): (f64, f64) = evaluateSub(&sub, &testPairs);
-    let (consT1, consT3): (f64, f64) = evaluateConscious(&sub, &cons, &testPairs);
+    // final metrics
+    let mut top1 = 0usize;
+    let mut top3 = 0usize;
+    for (ctx, target) in &testPairs {
+        let preds = sub.top(ctx, 3);
+        if preds.first().map(|p| p == target).unwrap_or(false) { top1 += 1; }
+        if preds.iter().any(|p| p == target) { top3 += 1; }
+    }
+    let nTest = testPairs.len().max(1);
 
     println!();
-    println!("labeledTokens={} unlabeledTokens={} testTokens={} vocabulary={}",
-        labeled.iter().map(|d| d.len()).sum::<usize>(),
-        unlabeled.iter().map(|d| d.len()).sum::<usize>(),
-        testPairs.len(),
-        freq.len());
-    println!("NOTE: data highly repetitive (avg bigram jaccard ~0.22) — scores inflated");
-
-    println!();
-    println!("{:<52} {:>8} {:>8}", "model", "top1", "top3");
-    println!("{}", "-".repeat(72));
-    println!("{:<52} {:>7.2}% {:>7.2}%", "unigram (most frequent)", uniTop1 * 100.0, uniTop3 * 100.0);
-    println!("{:<52} {:>7.2}% {:>7.2}%", "backoff n-gram (train only)", ngT1 * 100.0, ngT3 * 100.0);
-    println!("{:<52} {:>7.2}% {:>7.2}%", "perception / direct (train only)", dirT1 * 100.0, dirT3 * 100.0);
-    println!("{:<52} {:>7.2}% {:>7.2}%", "full loop perception+surprise", subT1 * 100.0, subT3 * 100.0);
-    println!("{:<52} {:>7.2}% {:>7.2}%", "Consciousness after loop", consT1 * 100.0, consT3 * 100.0);
-
-    println!();
-    println!("DIAGNOSTICS");
+    println!("=== RESULT ===");
+    println!("steps={} surprises={} consciousActions={}", step, surpriseCount, consciousActions);
+    println!("focus final={:.3} fades={} consciousSteps={} subOnlySteps={}",
+        focus.level, focus.fades, focus.consciousSteps, focus.subconsciousOnlySteps);
+    println!("test top1={:.2}% top3={:.2}%", top1 as f64 / nTest as f64 * 100.0, top3 as f64 / nTest as f64 * 100.0);
     println!("passiveWrites={} consciousWrites={}", sub.passiveWrites, sub.consciousWrites);
-    println!("linearWork calls={} successes={} rate={:.6} exhausted={}",
-        work.calls, work.successes,
-        work.successes as f64 / work.calls.max(1) as f64,
-        work.exhausted);
+    println!("linearWork rate={:.6}", work.successes as f64 / work.calls.max(1) as f64);
 }
