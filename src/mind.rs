@@ -97,7 +97,7 @@ pub fn contextFeatures(ctx: &Context) -> Vec<String> {
     f
 }
 
-pub struct FeatureRow { weights: HashMap<String, f64>, total: f64, cap: Option<f64>, top: Vec<(String, f64)> }
+pub struct FeatureRow { weights: HashMap<String, f64>, total: f64, cap: Option<f64>, top: Vec<(String, f64)>, hits: u64 }
 
 /// Order of a feature row: heavier first, then the token name.
 fn rowBetter(a: &(String, f64), b: &(String, f64)) -> Ordering {
@@ -105,8 +105,9 @@ fn rowBetter(a: &(String, f64), b: &(String, f64)) -> Ordering {
 }
 
 impl FeatureRow {
-    fn new(cap: Option<f64>) -> Self { Self { weights: HashMap::new(), total: 0.0, cap, top: Vec::new() } }
+    fn new(cap: Option<f64>) -> Self { Self { weights: HashMap::new(), total: 0.0, cap, top: Vec::new(), hits: 0 } }
     fn bump(&mut self, token: &str, amount: f64) {
+        self.hits += 1;
         let weight = {
             let w = self.weights.entry(token.to_string()).or_insert(0.0);
             *w += amount;
@@ -159,12 +160,33 @@ impl FeatureRow {
 pub struct Subconscious {
     globalFreq: HashMap<String, u32>, commonTokens: Vec<String>,
     rows: HashMap<String, FeatureRow>, cap: Option<f64>, passiveWrites: u64, consciousWrites: u64,
+    maxRows: usize, evicted: u64,
 }
 impl Subconscious {
     pub fn new(globalFreq: HashMap<String, u32>, cap: Option<f64>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0, maxRows: 0, evicted: 0 }
+    }
+    /// Upper bound for the number of feature rows. When it is reached the
+    /// least used rows are dropped, so the memory of the mind stays bounded
+    /// on any corpus. 0 = no limit.
+    pub fn setMaxRows(&mut self, maxRows: usize) { self.maxRows = maxRows; }
+    pub fn evicted(&self) -> u64 { self.evicted }
+    fn evictIfNeeded(&mut self) {
+        if self.maxRows == 0 || self.rows.len() <= self.maxRows { return; }
+        let target = self.maxRows * 9 / 10;
+        let mut victims: Vec<String> = Vec::new();
+        {
+            let mut all: Vec<(u64, &String)> = self.rows.iter().map(|(k, r)| (r.hits, k)).collect();
+            let dropCount = all.len().saturating_sub(target);
+            if dropCount == 0 { return; }
+            all.select_nth_unstable_by(dropCount, |a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+            for i in 0..dropCount { victims.push(all[i].1.clone()); }
+        }
+        let dropped = victims.len() as u64;
+        for key in victims { self.rows.remove(&key); }
+        self.evicted += dropped;
     }
     fn row(&mut self, feature: &str) -> &mut FeatureRow {
         self.rows.entry(feature.to_string()).or_insert_with(|| FeatureRow::new(self.cap))
@@ -172,6 +194,7 @@ impl Subconscious {
     pub fn write(&mut self, ctx: &Context, token: &str, passive: bool) {
         for feature in contextFeatures(ctx) { self.row(&feature).bump(token, INCREMENT); }
         if passive { self.passiveWrites += 1; } else { self.consciousWrites += 1; }
+        self.evictIfNeeded();
     }
     pub fn receiveObservation(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, true); }
     pub fn receiveConsciousAction(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, false); }
@@ -249,6 +272,7 @@ impl Subconscious {
         for (feature, row) in &self.rows {
             writeStr(out, feature)?;
             writeF64(out, row.total)?;
+            writeU64(out, row.hits)?;
             writeU32(out, row.weights.len() as u32)?;
             for (token, weight) in &row.weights {
                 writeStr(out, token)?;
@@ -271,9 +295,11 @@ impl Subconscious {
         for _ in 0..rows {
             let feature = readStr(input)?;
             let total = readF64(input)?;
+            let hits = readU64(input)?;
             let entries = readU32(input)?;
             let mut row = FeatureRow::new(self.cap);
             row.total = total;
+            row.hits = hits;
             for _ in 0..entries {
                 let token = readStr(input)?;
                 let weight = readF64(input)?;
@@ -298,6 +324,7 @@ pub struct Consciousness {
     globalFreq: HashMap<String, u32>, commonTokens: Vec<String>,
     edges: HashMap<String, HashMap<String, f64>>, totals: HashMap<String, f64>,
     edgeTop: HashMap<String, Vec<(String, f64)>>,
+    maxFeatures: usize, evicted: u64,
     actions: u64, failedUpdates: u64,
 }
 
@@ -313,7 +340,33 @@ impl Consciousness {
     pub fn new(globalFreq: HashMap<String, u32>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), actions: 0, failedUpdates: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), maxFeatures: 0, evicted: 0, actions: 0, failedUpdates: 0 }
+    }
+    /// Upper bound for the number of features that keep conscious edges.
+    /// 0 = no limit.
+    pub fn setMaxFeatures(&mut self, maxFeatures: usize) { self.maxFeatures = maxFeatures; }
+    pub fn evicted(&self) -> u64 { self.evicted }
+    /// Drops the least used features so that the memory stays bounded.
+    fn evictIfNeeded(&mut self) {
+        if self.maxFeatures == 0 || self.edges.len() <= self.maxFeatures { return; }
+        let target = self.maxFeatures * 9 / 10;
+        let mut victims: Vec<String> = Vec::new();
+        {
+            // the total of a feature is proportional to the number of times
+            // it was updated, so it is the usage counter of the feature
+            let mut all: Vec<(u64, &String)> = self.edges.keys()
+                .map(|k| (*self.totals.get(k).unwrap_or(&0.0) as u64, k)).collect();
+            let dropCount = all.len().saturating_sub(target);
+            if dropCount == 0 { return; }
+            all.select_nth_unstable_by(dropCount, |a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+            for i in 0..dropCount { victims.push(all[i].1.clone()); }
+        }
+        for key in victims {
+            self.edges.remove(&key);
+            self.totals.remove(&key);
+            self.edgeTop.remove(&key);
+            self.evicted += 1;
+        }
     }
     fn activeFeatures(&self, ctx: &Context, proposals: &[String]) -> Vec<String> {
         let mut f = contextFeatures(ctx);
@@ -332,6 +385,7 @@ impl Consciousness {
             *self.totals.entry(feature.clone()).or_insert(0.0) += INCREMENT;
             self.updateEdgeTop(&feature, target, weight);
         }
+        self.evictIfNeeded();
         true
     }
     /// Keeps the best EDGETAKE continuations of a feature up to date.
