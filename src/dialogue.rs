@@ -68,10 +68,13 @@ pub struct TrainLimits {
     pub deadline: Option<Instant>,
     /// Stop when the process grows above this many megabytes (0 = no limit).
     pub maxMb: u64,
+    /// Memory budget of the mind in megabytes (0 = no budget). The number of
+    /// remembered features follows it, so the run can go on for ever.
+    pub ramBudgetMb: u64,
 }
 
 impl Default for TrainLimits {
-    fn default() -> TrainLimits { TrainLimits { deadline: None, maxMb: 0 } }
+    fn default() -> TrainLimits { TrainLimits { deadline: None, maxMb: 0, ramBudgetMb: 0 } }
 }
 
 /// How the beginning of the stage is shown live.
@@ -177,15 +180,18 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
             }
         }
         if train && st.steps >= nextProgress {
+            fitMemory(sub, cons, limits.ramBudgetMb);
+            let rss = residentMb();
             println!(
-                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}Mb){}",
+                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}/{}Mb){}",
                 st.steps,
                 hitRate(st.top1, st.steps),
                 hitRate(st.top3, st.steps),
                 hitRate(st.cand, st.steps),
                 st.candSize as f64 / st.steps.max(1) as f64,
                 started.elapsed().as_secs_f64(),
-                residentMb(),
+                rss,
+                limits.ramBudgetMb,
                 corpusProgress(status, started));
             let _ = io::stdout().flush();
             nextProgress += PROGRESSSTEP;
@@ -234,6 +240,25 @@ pub fn generateReply(
 
 fn isPunctuation(token: &str) -> bool {
     token == "." || token == "," || token == "?" || token == "!" || token == ";" || token == ":"
+}
+
+/// Keeps the mind inside the memory budget: when the process grows too big
+/// the least used features are dropped, when it shrinks too much the mind is
+/// allowed to remember more.
+fn fitMemory(sub: &mut Subconscious, cons: &mut Consciousness, budgetMb: u64) {
+    if budgetMb == 0 { return; }
+    let rss = residentMb();
+    let target = budgetMb * 85 / 100;
+    let rows = sub.rowStats().0;
+    let features = cons.edgeStats().0;
+    if rss > target {
+        let factor = (target as f64 / rss as f64).max(0.5);
+        sub.setMaxRows(((rows as f64 * factor) as usize).max(1000));
+        cons.setMaxFeatures(((features as f64 * factor) as usize).max(1000));
+    } else if rss < budgetMb * 60 / 100 {
+        sub.setMaxRows(rows + rows / 10 + 1000);
+        cons.setMaxFeatures(features + features / 10 + 1000);
+    }
 }
 
 /// Resident memory of the process, for the progress line of long runs.

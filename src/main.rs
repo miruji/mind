@@ -22,8 +22,8 @@ const MAXREPLYTOKENS: usize = 24;
 const UBUNTU_SAMPLE: usize = 4000;
 const UBUNTU_HOLDOUT: u64 = 10;
 const UBUNTU_HOLDCAP: usize = 2000;
-/// Upper bound for the number of feature rows the mind keeps.
-const MAXFEATURES: usize = 1_000_000;
+/// Memory budget of the mind in gigabytes.
+const RAMBUDGETGB: u64 = 8;
 const LIVESTEPS: u64 = 600;
 const STEPDELAYMS: u64 = 20;
 
@@ -33,7 +33,7 @@ struct Options {
     ubuntuFiles: u64,
     ubuntuSample: usize,
     maxMb: u64,
-    maxFeatures: usize,
+    ramGb: u64,
     delay: u64,
     maxReply: usize,
     save: Option<String>,
@@ -49,7 +49,7 @@ impl Options {
             ubuntuFiles: 0,
             ubuntuSample: UBUNTU_SAMPLE,
             maxMb: 0,
-            maxFeatures: MAXFEATURES,
+            ramGb: RAMBUDGETGB,
             delay: STEPDELAYMS,
             maxReply: MAXREPLYTOKENS,
             save: None,
@@ -80,9 +80,9 @@ impl Options {
                     i += 1;
                     opts.maxMb = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
                 }
-                "--max-features" => {
+                "--ram" => {
                     i += 1;
-                    opts.maxFeatures = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(MAXFEATURES);
+                    opts.ramGb = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(RAMBUDGETGB);
                 }
                 "--delay" => {
                     i += 1;
@@ -156,10 +156,9 @@ fn main() {
     let mut work = LinearWork::new(P1);
     let mut sub = Subconscious::new(HashMap::new(), Some(CAP));
     let mut cons = mind::Consciousness::new(HashMap::new());
-    sub.setMaxRows(opts.maxFeatures);
-    cons.setMaxFeatures(opts.maxFeatures);
-    if opts.maxFeatures > 0 {
-        println!("mind limit: {} features (the weakest are forgotten)", opts.maxFeatures);
+    let ramBudgetMb = opts.ramGb * 1024;
+    if opts.ramGb > 0 {
+        println!("memory budget: {} Gb for the mind (the weakest features are forgotten)", opts.ramGb);
     }
     let mut focus = Focus::new();
     let mut cp = checkpoint::Checkpoint::default();
@@ -196,6 +195,8 @@ fn main() {
     } else {
         None
     };
+    let filesAtStart = cp.filesDone;
+    let stageStart = Instant::now();
     let mut ubuntu = CountingDialogs::new(SplitDialogs::at(
         UbuntuDialogs::withLimit(root, opts.ubuntuFiles, cp.filesDone),
         cp.dialoguesDone, UBUNTU_HOLDOUT, UBUNTU_HOLDCAP));
@@ -204,7 +205,7 @@ fn main() {
     let stats = dialogue::runReplies(
         &mut ubuntu, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
         true,
-        TrainLimits { deadline, maxMb: opts.maxMb },
+        TrainLimits { deadline, maxMb: opts.maxMb, ramBudgetMb },
         Some(&status),
         LiveOptions { steps: opts.steps, delayMs: opts.delay });
     cp.train.merge(&stats);
@@ -250,6 +251,14 @@ fn main() {
     println!("stage took {:.1}s", started.elapsed().as_secs_f64());
     println!("memory: {} Mb", dialogue::residentMb());
     println!("forgotten: rows={} features={}", sub.evicted(), cons.evicted());
+    {
+        let elapsed = stageStart.elapsed().as_secs_f64().max(0.001);
+        let rate = (cp.filesDone.saturating_sub(filesAtStart)) as f64 / elapsed;
+        let remaining = totalFiles.saturating_sub(cp.filesDone);
+        let eta = remaining as f64 / rate.max(0.0001);
+        println!("eta to the end of the corpus: {:.0} min ({} files left, {:.0} files/s)",
+            eta / 60.0, remaining, rate);
+    }
 
     // ================= checkpoint ===========================================
     if let Some(path) = &opts.save {
