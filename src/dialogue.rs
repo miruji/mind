@@ -1,5 +1,7 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::time::Instant;
 
 use crate::corpus::{tokenizeDialogue, Dialogue, PromptModel};
 use crate::mind::{
@@ -74,17 +76,42 @@ fn slide(history: &[String], token: &str) -> Vec<String> {
 #[derive(Default)]
 pub struct ActStats { pub steps: u64, pub top1: u64, pub top3: u64, pub surprises: u64, pub wills: u64 }
 
+/// Where the `act:` feature of the reply model comes from.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ActSource {
+    /// The gold act of the corpus (teacher forcing).
+    Gold,
+    /// The act predicted by the act mind (what the chat really uses).
+    Predicted,
+}
+
+/// Stop conditions of a training run.
+#[derive(Clone, Copy)]
+pub struct TrainLimits {
+    /// Wall clock deadline.
+    pub deadline: Option<Instant>,
+    /// Stop when the process grows above this many megabytes (0 = no limit).
+    pub maxMb: u64,
+}
+
+impl Default for TrainLimits {
+    fn default() -> TrainLimits { TrainLimits { deadline: None, maxMb: 0 } }
+}
+
 /// Train (or only evaluate) the act classifier.
-pub fn runActs(
-    dialogs: &[Dialogue],
+pub fn runActs<I, D>(
+    dialogs: I,
     mind: &mut ActMind,
     promptModel: &PromptModel,
     work: &mut LinearWork,
     focus: &mut Focus,
     train: bool,
-) -> ActStats {
+) -> ActStats
+where I: Iterator<Item = D>, D: Borrow<Dialogue> {
     let mut st = ActStats::default();
     for d in dialogs {
+        let d = d.borrow();
+        if d.acts.len() != d.turns.len() { continue; }
         for i in 1..d.turns.len() {
             let ctx = mind.context(&d.turns[i - 1], promptModel);
             let target = actLabel(d.acts[i]);
@@ -116,15 +143,19 @@ pub fn runActs(
 pub struct ReplyStats {
     pub steps: u64, pub top1: u64, pub top3: u64, pub surprises: u64, pub wills: u64,
     pub turns: u64, pub turnTop1: u64, pub turnTop3: u64,
+    /// How often the true token was reachable at all (it was one of the
+    /// candidates of some feature). This is the ceiling of top1/top3.
+    pub cand: u64,
+    pub candSize: u64,
 }
 
 /// Train (or only evaluate) the reply model.
 ///
-/// `predictedActs` selects what the `act:` feature carries: the gold act of
-/// the training corpus (teacher forcing) or the act predicted by the act mind
-/// (the honest pipeline that the chat uses).
-pub fn runReplies(
-    dialogs: &[Dialogue],
+/// `actSource` selects what the `act:` feature carries: the gold act of the
+/// training corpus (teacher forcing), the act predicted by the act mind (the
+/// honest pipeline that the chat uses) or no act at all.
+pub fn runReplies<I, D>(
+    dialogs: I,
     promptModel: &PromptModel,
     sub: &mut Subconscious,
     cons: &mut Consciousness,
@@ -132,27 +163,35 @@ pub fn runReplies(
     focus: &mut Focus,
     actMind: &ActMind,
     train: bool,
-    predictedActs: bool,
-) -> ReplyStats {
+    actSource: ActSource,
+    limits: TrainLimits,
+) -> ReplyStats
+where I: Iterator<Item = D>, D: Borrow<Dialogue> {
     let mut st = ReplyStats::default();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut nextProgress = PROGRESSSTEP;
-    for d in dialogs {
+    let mut stopped = false;
+    'corpus: for d in dialogs {
+        let d = d.borrow();
         for i in 1..d.turns.len() {
             let prompt = &d.turns[i - 1];
             let bag = promptModel.bag(prompt);
-            let act = if predictedActs {
-                let actCtx = actMind.context(prompt, promptModel);
-                actMind.predict(&actCtx).0
-            } else {
-                d.acts[i]
+            let act = match actSource {
+                ActSource::Gold => d.acts.get(i).copied().unwrap_or(0),
+                ActSource::Predicted => {
+                    let actCtx = actMind.context(prompt, promptModel);
+                    actMind.predict(&actCtx).0
+                }
             };
             let mut history = makeWindow(prompt, DLGWINDOW);
             let mut first = true;
             for t in &d.turns[i] {
                 let ctx = Context::withBag(history.clone(), bag.clone(), MODE_REPLY).withAct(act);
-                let props = sub.top(&ctx, PROPOSALCOUNT);
+                let (props, cand) = sub.topWithCandidates(&ctx, PROPOSALCOUNT);
                 st.steps += 1;
+                st.candSize += cand.len() as u64;
+                let reachable = cand.contains(t);
+                if reachable { st.cand += 1; }
                 let hit1 = props.first().map_or(false, |p| p == t);
                 let hit3 = props.contains(t);
                 if hit1 { st.top1 += 1; }
@@ -178,17 +217,29 @@ pub fn runReplies(
                 }
                 history = slide(&history, t);
             }
+            if let Some(dl) = limits.deadline {
+                if Instant::now() >= dl { stopped = true; break 'corpus; }
+            }
         }
         if train && st.steps >= nextProgress {
             println!(
-                "  ... reply steps={} t1={:.1}% t3={:.1}% ({:.1}s)",
+                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}Mb)",
                 st.steps,
                 crate::mind::hitRate(st.top1, st.steps),
                 crate::mind::hitRate(st.top3, st.steps),
-                started.elapsed().as_secs_f64());
+                crate::mind::hitRate(st.cand, st.steps),
+                st.candSize as f64 / st.steps.max(1) as f64,
+                started.elapsed().as_secs_f64(),
+                residentMb());
             let _ = io::stdout().flush();
             nextProgress += PROGRESSSTEP;
         }
+        if limits.maxMb > 0 && residentMb() >= limits.maxMb { stopped = true; break 'corpus; }
+    }
+    if stopped {
+        println!(
+            "  ... training stopped early: steps={} ({:.1}s, {}Mb)",
+            st.steps, started.elapsed().as_secs_f64(), residentMb());
     }
     st
 }
@@ -212,7 +263,6 @@ pub fn generateReply(
     let act = forcedAct.unwrap_or(predicted);
     let mut history = makeWindow(prompt, DLGWINDOW);
     let mut out = String::new();
-    let mut lastGenerated: Option<String> = None;
     for _ in 0..maxTokens {
         let ctx = Context::withBag(history.clone(), bag.clone(), MODE_REPLY).withAct(act);
         let props = sub.top(&ctx, PROPOSALCOUNT);
@@ -221,17 +271,10 @@ pub fn generateReply(
         if work.unit() < focus.probability() {
             if let Some(pick) = cons.chooseAction(work, &ctx, &props) { chosen = pick; }
         }
-        // Decoding guard: the mind must not repeat the token it just said.
-        if let Some(prev) = &lastGenerated {
-            if chosen == *prev {
-                if let Some(next) = props.iter().skip(1).find(|p| *p != prev) { chosen = next.clone(); }
-            }
-        }
         sub.receiveConsciousAction(&ctx, &chosen);
         let stop = chosen == "." || chosen == "?" || chosen == "!";
         if !out.is_empty() && !isPunctuation(&chosen) { out.push(' '); }
         out.push_str(&chosen);
-        lastGenerated = Some(chosen.clone());
         if stop { break; }
         history = slide(&history, &chosen);
     }
@@ -240,6 +283,19 @@ pub fn generateReply(
 
 fn isPunctuation(token: &str) -> bool {
     token == "." || token == "," || token == "?" || token == "!" || token == ";" || token == ":"
+}
+
+/// Resident memory of the process, for the progress line of long runs.
+pub fn residentMb() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+                return kb / 1024;
+            }
+        }
+    }
+    0
 }
 
 /// Interactive chat: the user writes a line, the mind answers on enter.

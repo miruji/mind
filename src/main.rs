@@ -11,8 +11,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corpus::{loadDialogues, loadDocs, PromptModel};
-use dialogue::{ActMind, ActStats, ReplyStats};
+use corpus::{loadDialogues, loadDocs, CountingDialogs, PromptModel, SplitDialogs, UbuntuDialogs};
+use dialogue::{ActMind, ActSource, ActStats, ReplyStats};
 use mind::{
     colorForFocus, colorForQuality, hitRate, makeContext, resetColor, Consciousness, Focus,
     LinearWork, Subconscious, CAP, FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD, P1, PROPOSALCOUNT,
@@ -21,8 +21,12 @@ use mind::{
 const LIVESTEPS: u64 = 600;
 const STEPDELAYMS: u64 = 20;
 const DIALOGUE_ROOT: &str = "data2/ijcnlp_dailydialog";
+const UBUNTU_ROOT: &str = "data2/ubuntu_dialogs/dialogs";
 const MAXREPLYTOKENS: usize = 24;
 const QUALITYALPHA: f64 = 0.12;
+const UBUNTU_SAMPLE: usize = 4000;
+const UBUNTU_HOLDOUT: u64 = 10;
+const UBUNTU_HOLDCAP: usize = 2000;
 
 /// Rolling quality of the live stream: 1.0 for a Top1 hit, 0.5 for a Top3
 /// only hit, 0.0 for a miss. Drives the green -> red colour of the [ ] block.
@@ -42,6 +46,9 @@ struct Options {
     chat: bool,
     delay: u64,
     maxReply: usize,
+    minutes: u64,
+    ubuntuSample: usize,
+    maxMb: u64,
 }
 
 impl Options {
@@ -52,6 +59,9 @@ impl Options {
             chat: true,
             delay: STEPDELAYMS,
             maxReply: MAXREPLYTOKENS,
+            minutes: 1,
+            ubuntuSample: UBUNTU_SAMPLE,
+            maxMb: 0,
         };
         let args: Vec<String> = std::env::args().collect();
         let mut i = 1;
@@ -72,6 +82,18 @@ impl Options {
                 "--max-reply" => {
                     i += 1;
                     opts.maxReply = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(MAXREPLYTOKENS);
+                }
+                "--minutes" => {
+                    i += 1;
+                    opts.minutes = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1);
+                }
+                "--ubuntu-sample" => {
+                    i += 1;
+                    opts.ubuntuSample = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(UBUNTU_SAMPLE);
+                }
+                "--max-mb" => {
+                    i += 1;
+                    opts.maxMb = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
                 }
                 "--no-chat" => opts.chat = false,
                 other => println!("unknown option: {}", other),
@@ -106,6 +128,11 @@ fn printReplyStats(label: &str, st: &ReplyStats) {
         hitRate(st.turnTop1, st.turns),
         hitRate(st.turnTop3, st.turns),
         st.turnTop1, st.turns, st.turnTop3, st.turns);
+    println!(
+        "{}: reachable={:.1}% (ceiling for top1/top3), candidates per step={:.0}",
+        label,
+        hitRate(st.cand, st.steps),
+        st.candSize as f64 / st.steps.max(1) as f64);
 }
 
 fn main() {
@@ -218,7 +245,7 @@ fn main() {
     println!("CORPUS={}; trainDialogs={} trainTurns={} testDialogs={} testTurns={}",
         DIALOGUE_ROOT, train.len(), trainTurns, test.len(), testTurns);
 
-    let promptModel = PromptModel::build(&train);
+    let promptModel = PromptModel::build(train.iter());
     // The mind keeps everything it learned on the docs corpus, the dialogue
     // phase only adds the new words to its vocabulary.
     let dlgFreq = dialogue::dialogueFrequency(&train);
@@ -228,10 +255,12 @@ fn main() {
     let mut actMind = ActMind::new(&train);
     println!();
     println!("--- phase 2: learning the dialogs ---");
-    let actTrain = dialogue::runActs(&train, &mut actMind, &promptModel, &mut work, &mut focus, true);
+    let actTrain = dialogue::runActs(
+        train.iter(), &mut actMind, &promptModel, &mut work, &mut focus, true);
     printActStats("acts  train", &actTrain);
     let replyTrain = dialogue::runReplies(
-        &train, &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind, true, false);
+        train.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind,
+        true, ActSource::Gold, dialogue::TrainLimits::default());
     printReplyStats("reply train", &replyTrain);
     {
         let (rows, entries, biggest) = sub.rowStats();
@@ -241,16 +270,61 @@ fn main() {
     }
     println!("phase 2 took {:.1}s", started.elapsed().as_secs_f64());
 
+    // ================= phase 2b: ubuntu irc support logs ====================
+    let ubuntuRoot = Path::new(UBUNTU_ROOT);
+    let mut ubuntuPromptModel: Option<PromptModel> = None;
+    let mut ubuntuTrainStats: Option<ReplyStats> = None;
+    let mut ubuntuEvalStats: Option<ReplyStats> = None;
+    if opts.minutes > 0 && ubuntuRoot.exists() {
+        println!();
+        println!("--- phase 2b: ubuntu irc support logs ({}) ---", UBUNTU_ROOT);
+        println!("budget: {} min", opts.minutes);
+        let sample = UbuntuDialogs::new(ubuntuRoot).take(opts.ubuntuSample);
+        let ubuntuPrompt = PromptModel::build(sample);
+        println!("prompt model: {} files sampled", opts.ubuntuSample);
+        let deadline = Instant::now() + Duration::from_secs(opts.minutes * 60);
+        let mut ubuntu = CountingDialogs::new(SplitDialogs::new(
+            UbuntuDialogs::new(ubuntuRoot), UBUNTU_HOLDOUT, UBUNTU_HOLDCAP));
+        let stats = dialogue::runReplies(
+            &mut ubuntu, &ubuntuPrompt, &mut sub, &mut cons, &mut work, &mut focus, &actMind,
+            true, ActSource::Predicted,
+            dialogue::TrainLimits { deadline: Some(deadline), maxMb: opts.maxMb });
+        printReplyStats("reply ubuntu", &stats);
+        println!(
+            "files read={} dialogues={} turns={} ({:.1}s)",
+            ubuntu.inner.inner.read, ubuntu.inner.counter, ubuntu.inner.inner.turns,
+            started.elapsed().as_secs_f64());
+        let held = std::mem::take(&mut ubuntu.inner.held);
+        if !held.is_empty() {
+            let evalStats = dialogue::runReplies(
+                held.iter(), &ubuntuPrompt, &mut sub, &mut cons, &mut work, &mut focus, &actMind,
+                false, ActSource::Predicted, dialogue::TrainLimits::default());
+            printReplyStats("reply ubuntu holdout", &evalStats);
+            ubuntuEvalStats = Some(evalStats);
+        }
+        sub.observeVocabulary(&ubuntu.freq);
+        cons.observeVocabulary(&ubuntu.freq);
+        ubuntuTrainStats = Some(stats);
+        ubuntuPromptModel = Some(ubuntuPrompt);
+        println!("phase 2b took {:.1}s", started.elapsed().as_secs_f64());
+    } else if opts.minutes > 0 {
+        println!();
+        println!("--- phase 2b skipped: {} not found ---", UBUNTU_ROOT);
+    }
+
     // ================= phase 3: quality of the prediction ===================
     println!();
     println!("--- phase 3: evaluation on the test split ---");
-    let actEval = dialogue::runActs(&test, &mut actMind, &promptModel, &mut work, &mut focus, false);
+    let actEval = dialogue::runActs(
+        test.iter(), &mut actMind, &promptModel, &mut work, &mut focus, false);
     printActStats("acts  test", &actEval);
     let replyEval = dialogue::runReplies(
-        &test, &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind, false, true);
+        test.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind,
+        false, ActSource::Predicted, dialogue::TrainLimits::default());
     printReplyStats("reply test (predicted act)", &replyEval);
     let replyOracle = dialogue::runReplies(
-        &test, &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind, false, false);
+        test.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus, &actMind,
+        false, ActSource::Gold, dialogue::TrainLimits::default());
     printReplyStats("reply test (gold act)", &replyOracle);
     println!("phase 3 took {:.1}s", started.elapsed().as_secs_f64());
 
@@ -270,6 +344,16 @@ fn main() {
         hitRate(replyEval.top3, replyEval.steps),
         hitRate(replyOracle.top1, replyOracle.steps),
         hitRate(replyOracle.top3, replyOracle.steps));
+    if let Some(st) = &ubuntuTrainStats {
+        println!(
+            "reply ubuntu top1={:.1}% top3={:.1}% (steps {})",
+            hitRate(st.top1, st.steps), hitRate(st.top3, st.steps), st.steps);
+    }
+    if let Some(st) = &ubuntuEvalStats {
+        println!(
+            "reply ubuntu holdout top1={:.1}% top3={:.1}% (steps {})",
+            hitRate(st.top1, st.steps), hitRate(st.top3, st.steps), st.steps);
+    }
     println!(
         "focus final={:.3} fades={} avgConsciousness={:.1}%",
         focus.level(), focus.fades(), focus.avgPercent());
@@ -278,7 +362,8 @@ fn main() {
 
     // ================= phase 4: interactive chat ===========================
     if opts.chat {
+        let chatPrompt = ubuntuPromptModel.as_ref().unwrap_or(&promptModel);
         dialogue::chatLoop(
-            &mut sub, &mut cons, &mut work, &mut focus, &promptModel, &actMind, opts.maxReply);
+            &mut sub, &mut cons, &mut work, &mut focus, chatPrompt, &actMind, opts.maxReply);
     }
 }

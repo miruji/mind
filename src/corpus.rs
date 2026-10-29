@@ -1,5 +1,7 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 const HELPDIRS: &[&str] = &["manual", "command", "policy", "guide", "cpack_gen"];
@@ -133,10 +135,12 @@ pub fn loadDialogues(root: &Path) -> (Vec<Dialogue>, Vec<Dialogue>) {
 pub struct PromptModel { df: HashMap<String, u32>, n: u32 }
 
 impl PromptModel {
-    pub fn build(dialogs: &[Dialogue]) -> PromptModel {
+    pub fn build<I, D>(dialogs: I) -> PromptModel
+    where I: Iterator<Item = D>, D: Borrow<Dialogue> {
         let mut df: HashMap<String, u32> = HashMap::new();
         let mut n = 0u32;
         for d in dialogs {
+            let d = d.borrow();
             for i in 1..d.turns.len() {
                 let mut seen = HashSet::new();
                 for w in contentWords(&d.turns[i - 1]) {
@@ -171,4 +175,155 @@ pub fn contentWords(tokens: &[String]) -> Vec<String> {
         if seen.insert(t.clone()) { out.push(t.clone()); }
     }
     out
+}
+
+/// Longest turn kept from the noisy support logs.
+pub const MAXTURNTOKENS: usize = 40;
+
+/// One Ubuntu IRC support log: `timestamp \t nick \t target \t message`.
+/// The files live in `dialogs/<group>/<file>.tsv`, there are about 1.8
+/// million of them, so they are read one by one and never kept in memory.
+pub fn readUbuntuFile(path: &Path) -> Option<Dialogue> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::with_capacity(1 << 16, file);
+    let mut turns: Vec<Vec<String>> = Vec::new();
+    let mut currentKey: Option<(String, String)> = None;
+    let mut current: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        if line.is_empty() { continue; }
+        let mut parts = line.splitn(4, '\t');
+        let _stamp = parts.next().unwrap_or("");
+        let nick = parts.next().unwrap_or("").trim().to_string();
+        let target = parts.next().unwrap_or("").trim().to_string();
+        let message = parts.next().unwrap_or("");
+        if nick.is_empty() && target.is_empty() { continue; }
+        let key = (nick, target);
+        if currentKey.as_ref() != Some(&key) {
+            if !current.is_empty() { turns.push(std::mem::take(&mut current)); }
+            currentKey = Some(key);
+        }
+        let tokens = tokenizeDialogue(message);
+        if tokens.is_empty() { continue; }
+        for t in tokens {
+            if current.len() >= MAXTURNTOKENS { break; }
+            current.push(t);
+        }
+    }
+    if !current.is_empty() { turns.push(current); }
+    if turns.len() < 2 { return None; }
+    Some(Dialogue { turns, acts: Vec::new() })
+}
+
+/// Streaming reader over the whole Ubuntu support log tree.
+pub struct UbuntuDialogs {
+    dirs: Vec<PathBuf>,
+    dirIdx: usize,
+    files: Vec<PathBuf>,
+    fileIdx: usize,
+    pub read: u64,
+    pub turns: u64,
+}
+
+impl UbuntuDialogs {
+    pub fn new(root: &Path) -> UbuntuDialogs {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() { dirs.push(path); }
+            }
+        }
+        dirs.sort();
+        UbuntuDialogs { dirs, dirIdx: 0, files: Vec::new(), fileIdx: 0, read: 0, turns: 0 }
+    }
+
+    fn loadDir(&mut self) -> bool {
+        while self.dirIdx < self.dirs.len() {
+            let dir = &self.dirs[self.dirIdx];
+            self.dirIdx += 1;
+            let mut files: Vec<PathBuf> = Vec::new();
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "tsv").unwrap_or(false) { files.push(path); }
+                }
+            }
+            if files.is_empty() { continue; }
+            files.sort();
+            self.files = files;
+            self.fileIdx = 0;
+            return true;
+        }
+        self.files.clear();
+        self.fileIdx = 0;
+        false
+    }
+}
+
+impl Iterator for UbuntuDialogs {
+    type Item = Dialogue;
+    fn next(&mut self) -> Option<Dialogue> {
+        loop {
+            if self.fileIdx >= self.files.len() {
+                if !self.loadDir() { return None; }
+            }
+            let path = self.files[self.fileIdx].clone();
+            self.fileIdx += 1;
+            self.read += 1;
+            if let Some(d) = readUbuntuFile(&path) {
+                self.turns += d.turns.len() as u64;
+                return Some(d);
+            }
+        }
+    }
+}
+
+/// Splits a stream into a training part and a small held out part.
+pub struct SplitDialogs<I> {
+    pub inner: I,
+    pub counter: u64,
+    holdEvery: u64,
+    holdCap: usize,
+    pub held: Vec<Dialogue>,
+}
+
+impl<I> SplitDialogs<I> {
+    pub fn new(inner: I, holdEvery: u64, holdCap: usize) -> SplitDialogs<I> {
+        SplitDialogs { inner, counter: 0, holdEvery: holdEvery.max(1), holdCap, held: Vec::new() }
+    }
+}
+
+impl<I: Iterator<Item = Dialogue>> Iterator for SplitDialogs<I> {
+    type Item = Dialogue;
+    fn next(&mut self) -> Option<Dialogue> {
+        loop {
+            let d = self.inner.next()?;
+            self.counter += 1;
+            if self.counter % self.holdEvery == 0 {
+                if self.held.len() < self.holdCap { self.held.push(d); }
+                continue;
+            }
+            return Some(d);
+        }
+    }
+}
+
+/// Counts every token that passes through, so that the mind can learn the
+/// vocabulary of a streamed corpus.
+pub struct CountingDialogs<I> { pub inner: I, pub freq: HashMap<String, u32> }
+
+impl<I> CountingDialogs<I> {
+    pub fn new(inner: I) -> CountingDialogs<I> { CountingDialogs { inner, freq: HashMap::new() } }
+}
+
+impl<I: Iterator<Item = Dialogue>> Iterator for CountingDialogs<I> {
+    type Item = Dialogue;
+    fn next(&mut self) -> Option<Dialogue> {
+        let d = self.inner.next()?;
+        for turn in &d.turns {
+            for t in turn { *self.freq.entry(t.clone()).or_insert(0) += 1; }
+        }
+        Some(d)
+    }
 }

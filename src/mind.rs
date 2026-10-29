@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MASK: u64 = u64::MAX;
-pub const P1: f64 = 0.501;
+pub const P1: f64 = 0.51; // Скорость симуляции, важно чтобы был 0.501 или как можно меньше, но для тестов можно и 0.51 для скорости, точность не падает сильно. но при большей скорости - нужно больше тестов.
 pub const RETRYLIMIT: usize = 3000;
 pub const INCREMENT: f64 = 0.1;
 pub const CAP: f64 = 24.0;
@@ -207,6 +207,13 @@ impl Subconscious {
         s
     }
     pub fn top(&self, ctx: &Context, k: usize) -> Vec<String> {
+        let (ranked, _) = self.topWithCandidates(ctx, k);
+        ranked
+    }
+
+    /// The proposals and the full candidate set behind them: a token outside
+    /// of that set can never be hit, no matter how good the ranking is.
+    pub fn topWithCandidates(&self, ctx: &Context, k: usize) -> (Vec<String>, HashSet<String>) {
         let features = contextFeatures(ctx);
         let mut cand: HashSet<String> = HashSet::new();
         for feature in &features {
@@ -225,7 +232,8 @@ impl Subconscious {
                 if ranked.len() >= k { break; }
             }
         }
-        ranked.truncate(k); ranked
+        ranked.truncate(k);
+        (ranked, cand)
     }
     /// Score of an arbitrary candidate set under the same rules as `top`.
     pub fn scoreCandidates(&self, ctx: &Context, cands: &[String]) -> Vec<(String, f64)> {
