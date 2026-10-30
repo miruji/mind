@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use corpus::{countFiles, CountingDialogs, PromptModel, SplitDialogs, UbuntuDialogs};
+use corpus::{countFiles, PromptModel, SplitDialogs, UbuntuDialogs};
 use dialogue::{LiveOptions, ReplyStats, TrainLimits};
 use mind::{
     hitRate, Focus, LinearWork, Subconscious, CAP, FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD, P1,
@@ -23,7 +23,7 @@ const UBUNTU_SAMPLE: usize = 4000;
 const UBUNTU_HOLDOUT: u64 = 10;
 const UBUNTU_HOLDCAP: usize = 2000;
 /// Memory budget of the mind in gigabytes.
-const RAMBUDGETGB: u64 = 8;
+const RAMBUDGETGB: f64 = 8.0;
 const LIVESTEPS: u64 = 600;
 const STEPDELAYMS: u64 = 20;
 
@@ -33,7 +33,7 @@ struct Options {
     ubuntuFiles: u64,
     ubuntuSample: usize,
     maxMb: u64,
-    ramGb: u64,
+    ramGb: f64,
     delay: u64,
     maxReply: usize,
     save: Option<String>,
@@ -82,7 +82,7 @@ impl Options {
                 }
                 "--ram" => {
                     i += 1;
-                    opts.ramGb = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(RAMBUDGETGB);
+                    opts.ramGb = args.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(RAMBUDGETGB);
                 }
                 "--delay" => {
                     i += 1;
@@ -156,8 +156,8 @@ fn main() {
     let mut work = LinearWork::new(P1);
     let mut sub = Subconscious::new(HashMap::new(), Some(CAP));
     let mut cons = mind::Consciousness::new(HashMap::new());
-    let ramBudgetMb = opts.ramGb * 1024;
-    if opts.ramGb > 0 {
+    let ramBudgetMb = (opts.ramGb * 1024.0) as u64;
+    if opts.ramGb > 0.0 {
         println!("memory budget: {} Gb for the mind (the weakest features are forgotten)", opts.ramGb);
     }
     let mut focus = Focus::new();
@@ -197,10 +197,10 @@ fn main() {
     };
     let filesAtStart = cp.filesDone;
     let stageStart = Instant::now();
-    let mut ubuntu = CountingDialogs::new(SplitDialogs::at(
+    let mut ubuntu = SplitDialogs::at(
         UbuntuDialogs::withLimit(root, opts.ubuntuFiles, cp.filesDone),
-        cp.dialoguesDone, UBUNTU_HOLDOUT, UBUNTU_HOLDCAP));
-    let status = ubuntu.inner.inner.status.clone();
+        cp.dialoguesDone, UBUNTU_HOLDOUT, UBUNTU_HOLDCAP);
+    let status = ubuntu.inner.status.clone();
     status.chunkStart.set(cp.filesDone);
     let stats = dialogue::runReplies(
         &mut ubuntu, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
@@ -209,17 +209,17 @@ fn main() {
         Some(&status),
         LiveOptions { steps: opts.steps, delayMs: opts.delay });
     cp.train.merge(&stats);
-    cp.filesDone = ubuntu.inner.inner.read;
-    cp.dialoguesDone = ubuntu.inner.counter;
+    cp.filesDone = ubuntu.inner.read;
+    cp.dialoguesDone = ubuntu.counter;
     println!();
     printReplyStats("reply (this chunk)", &stats);
     println!(
         "files read={} dialogues={} turns={} ({:.1}s)",
-        ubuntu.inner.inner.read, ubuntu.inner.counter, ubuntu.inner.inner.turns,
+        ubuntu.inner.read, ubuntu.counter, ubuntu.inner.turns,
         started.elapsed().as_secs_f64());
 
     // ================= quality on the held out part ========================
-    let held = std::mem::take(&mut ubuntu.inner.held);
+    let held = std::mem::take(&mut ubuntu.held);
     if !held.is_empty() {
         let evalStats = dialogue::runReplies(
             held.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
@@ -229,8 +229,11 @@ fn main() {
         printReplyStats("reply holdout (this chunk)", &evalStats);
     }
 
-    sub.observeVocabulary(&ubuntu.freq);
-    cons.observeVocabulary(&ubuntu.freq);
+    // The vocabulary of the mind is taken from its own tables: no separate
+    // frequency map is kept in memory during the run.
+    let freqs = sub.tokenFrequencies();
+    sub.observeVocabulary(&freqs);
+    cons.observeVocabulary(&freqs);
 
     println!();
     println!("=== RESULT ===");
@@ -249,7 +252,7 @@ fn main() {
             rows, entries, biggest, feats, edges, biggestEdge);
     }
     println!("stage took {:.1}s", started.elapsed().as_secs_f64());
-    println!("memory: {} Mb", dialogue::residentMb());
+    println!("memory: {} Mb rss, {} Mb of tables", dialogue::residentMb(), dialogue::mindBytes(&sub, &cons) / (1024 * 1024));
     println!("forgotten: rows={} features={}", sub.evicted(), cons.evicted());
     {
         let elapsed = stageStart.elapsed().as_secs_f64().max(0.001);

@@ -11,7 +11,7 @@ use crate::dialogue::ReplyStats;
 use crate::mind::{Consciousness, Subconscious};
 
 const MAGIC: &[u8; 8] = b"MINDCKPT";
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 /// Everything that has to survive between two chunks.
 pub struct Checkpoint {

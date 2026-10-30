@@ -110,6 +110,7 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
     let mut nextProgress = PROGRESSSTEP;
     let mut stopped = false;
     let mut quality = Quality::new(0.12);
+    let mut mem = MemState::default();
     'corpus: for d in dialogs {
         let d = d.borrow();
         for i in 1..d.turns.len() {
@@ -180,18 +181,22 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
             }
         }
         if train && st.steps >= nextProgress {
-            fitMemory(sub, cons, limits.ramBudgetMb);
+            fitMemory(sub, cons, limits.ramBudgetMb, &mut mem);
+            sub.decayHits();
+            cons.decayHits();
             let rss = residentMb();
+            let tables = mindBytes(sub, cons) / (1024 * 1024);
             println!(
-                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, {}/{}Mb){}",
+                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, tables {}/{}Mb, rss {}Mb){}",
                 st.steps,
                 hitRate(st.top1, st.steps),
                 hitRate(st.top3, st.steps),
                 hitRate(st.cand, st.steps),
                 st.candSize as f64 / st.steps.max(1) as f64,
                 started.elapsed().as_secs_f64(),
-                rss,
+                tables,
                 limits.ramBudgetMb,
+                rss,
                 corpusProgress(status, started));
             let _ = io::stdout().flush();
             nextProgress += PROGRESSSTEP;
@@ -242,23 +247,89 @@ fn isPunctuation(token: &str) -> bool {
     token == "." || token == "," || token == "?" || token == "!" || token == ";" || token == ":"
 }
 
-/// Keeps the mind inside the memory budget: when the process grows too big
-/// the least used features are dropped, when it shrinks too much the mind is
-/// allowed to remember more.
-fn fitMemory(sub: &mut Subconscious, cons: &mut Consciousness, budgetMb: u64) {
+/// State of one table of the mind.
+struct TableState {
+    limit: usize,
+    lastBytes: u64,
+    shrunk: bool,
+}
+
+impl TableState {
+    fn new() -> TableState { TableState { limit: 0, lastBytes: 0, shrunk: false } }
+}
+
+/// Keeps the mind inside the memory budget. The size that is measured are
+/// the tables themselves (rows and entries), not the process memory, so the
+/// behaviour does not depend on the allocator.
+///
+/// When the tables grow over the budget the limit of the table is lowered and
+/// the weakest rows are dropped. If that did not help, the limit is not
+/// lowered again - the floor is always kept.
+fn fitMemory(
+    sub: &mut Subconscious,
+    cons: &mut Consciousness,
+    budgetMb: u64,
+    state: &mut MemState,
+) {
     if budgetMb == 0 { return; }
-    let rss = residentMb();
-    let target = budgetMb * 85 / 100;
-    let rows = sub.rowStats().0;
-    let features = cons.edgeStats().0;
-    if rss > target {
-        let factor = (target as f64 / rss as f64).max(0.5);
-        sub.setMaxRows(((rows as f64 * factor) as usize).max(1000));
-        cons.setMaxFeatures(((features as f64 * factor) as usize).max(1000));
-    } else if rss < budgetMb * 60 / 100 {
-        sub.setMaxRows(rows + rows / 10 + 1000);
-        cons.setMaxFeatures(features + features / 10 + 1000);
+    let maxBytes = budgetMb * 1024 * 1024;
+    let floorBytes = maxBytes / 10;
+    adjustTable(sub.bytes(), maxBytes / 2, floorBytes / 2, &mut state.sub, |limit| {
+        sub.setMaxRows(limit);
+    });
+    adjustTable(cons.bytes(), maxBytes / 2, floorBytes / 2, &mut state.cons, |limit| {
+        cons.setMaxFeatures(limit);
+    });
+}
+
+/// The memory of both tables of the mind in bytes.
+pub fn mindBytes(sub: &Subconscious, cons: &Consciousness) -> u64 {
+    sub.bytes() + cons.bytes()
+}
+
+/// Lowers or raises the limit of one table so that its size stays inside the
+/// budget. The limit is normally the whole budget: the table grows until it
+/// fills it and then the eviction keeps it there. The limit only goes lower
+/// when the tables need more memory than the estimate of their size says.
+///
+/// The limit never goes below the floor and it is not lowered again when the
+/// previous cleanup did not reduce the size.
+fn adjustTable(
+    bytes: u64,
+    maxBytes: u64,
+    floorBytes: u64,
+    st: &mut TableState,
+    mut set: impl FnMut(usize),
+) {
+    let maxRows = (maxBytes / crate::mind::BYTES_PER_ROW).max(1) as usize;
+    let floorRows = ((floorBytes / crate::mind::BYTES_PER_ROW) as usize).max(1000);
+    if bytes > maxBytes {
+        if st.shrunk && bytes >= st.lastBytes {
+            // the last cleanup did not help, do not squeeze the mind further
+            return;
+        }
+        let factor = (maxBytes as f64 / bytes as f64).max(0.5);
+        let current = if st.limit == 0 { bytes / crate::mind::BYTES_PER_ROW } else { st.limit as u64 };
+        let next = ((current as f64 * factor) as u64).max(floorRows as u64) as usize;
+        if next < current as usize {
+            st.limit = next;
+            set(next);
+            st.shrunk = true;
+            st.lastBytes = bytes;
+        }
+    } else if st.limit < maxRows {
+        // there is room again: the table may use the whole budget
+        st.limit = maxRows;
+        set(maxRows);
+        st.shrunk = false;
     }
+}
+
+/// Memory governor of the training.
+pub struct MemState { sub: TableState, cons: TableState }
+
+impl Default for MemState {
+    fn default() -> MemState { MemState { sub: TableState::new(), cons: TableState::new() } }
 }
 
 /// Resident memory of the process, for the progress line of long runs.

@@ -15,6 +15,22 @@ pub const PROPOSALCOUNT: usize = 3;
 pub const ROWTAKE: usize = 8;
 /// How many continuations of a feature are offered to the conscious choice.
 pub const EDGETAKE: usize = 3;
+/// How many edges one conscious feature may keep.
+pub const EDGECAP: usize = 32;
+/// Fresh rows are protected from the eviction until they are used this often.
+pub const MINHITS: u64 = 3;
+/// How many windows a row stays alive after its last use. A row that is not
+/// used any more becomes the first victim of the eviction.
+pub const FRESHGRACE: u64 = 4;
+/// The hits of a row lose this share of their weight on every decay, so that
+/// old rows do not stay strong forever.
+pub const HITDECAY: u64 = 9;
+/// Rough memory of one row or one feature of the tables.
+pub const BYTES_ROW: u64 = 512;
+/// Rough memory of one entry of a row or one edge.
+pub const BYTES_ENTRY: u64 = 96;
+/// Rough memory of a row together with its entries.
+pub const BYTES_PER_ROW: u64 = BYTES_ROW + 6 * BYTES_ENTRY;
 pub const BOS: &str = "<BOS>";
 /// Window size used by the dialogue phase.
 pub const DLGWINDOW: usize = 3;
@@ -97,7 +113,17 @@ pub fn contextFeatures(ctx: &Context) -> Vec<String> {
     f
 }
 
-pub struct FeatureRow { weights: HashMap<String, f64>, total: f64, cap: Option<f64>, top: Vec<(String, f64)>, hits: u64 }
+pub struct FeatureRow {
+    weights: HashMap<String, f64>, total: f64, cap: Option<f64>,
+    top: Vec<(String, f64)>,
+    /// How strong the row is now. It fades while the row is not used.
+    hits: u64,
+    /// How often the row was used in total. It never fades and it tells a
+    /// fresh row from an established one.
+    uses: u64,
+    /// The epoch of the last write, used to fade the rows that are not used.
+    seen: u64,
+}
 
 /// Order of a feature row: heavier first, then the token name.
 fn rowBetter(a: &(String, f64), b: &(String, f64)) -> Ordering {
@@ -105,9 +131,13 @@ fn rowBetter(a: &(String, f64), b: &(String, f64)) -> Ordering {
 }
 
 impl FeatureRow {
-    fn new(cap: Option<f64>) -> Self { Self { weights: HashMap::new(), total: 0.0, cap, top: Vec::new(), hits: 0 } }
-    fn bump(&mut self, token: &str, amount: f64) {
+    fn new(cap: Option<f64>) -> Self {
+        Self { weights: HashMap::new(), total: 0.0, cap, top: Vec::new(), hits: 0, uses: 0, seen: 0 }
+    }
+    fn bump(&mut self, token: &str, amount: f64, epoch: u64) {
         self.hits += 1;
+        self.uses += 1;
+        self.seen = epoch;
         let weight = {
             let w = self.weights.entry(token.to_string()).or_insert(0.0);
             *w += amount;
@@ -157,42 +187,90 @@ impl FeatureRow {
     }
 }
 
+/// Takes the `n` weakest rows of the list (the smaller number first, the
+/// name as a tie breaker) and puts their names into the list of the victims.
+fn takeWeakest(list: &mut Vec<(u64, &String)>, n: usize, victims: &mut Vec<String>) {
+    if n == 0 || list.is_empty() { return; }
+    let n = n.min(list.len());
+    if n < list.len() {
+        list.select_nth_unstable_by(n, |a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+    }
+    for i in 0..n { victims.push(list[i].1.clone()); }
+}
+
 pub struct Subconscious {
     globalFreq: HashMap<String, u32>, commonTokens: Vec<String>,
     rows: HashMap<String, FeatureRow>, cap: Option<f64>, passiveWrites: u64, consciousWrites: u64,
     maxRows: usize, evicted: u64,
+    /// The window of the training in which the rows are counted. It grows with
+    /// every decay and it tells how long ago a row was used.
+    epoch: u64,
 }
 impl Subconscious {
     pub fn new(globalFreq: HashMap<String, u32>, cap: Option<f64>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0, maxRows: 0, evicted: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0, maxRows: 0, evicted: 0, epoch: 0 }
     }
     /// Upper bound for the number of feature rows. When it is reached the
     /// least used rows are dropped, so the memory of the mind stays bounded
     /// on any corpus. 0 = no limit.
     pub fn setMaxRows(&mut self, maxRows: usize) { self.maxRows = maxRows; }
     pub fn evicted(&self) -> u64 { self.evicted }
+    /// Drops the least useful rows, so that the memory of the mind stays
+    /// bounded on any corpus.
+    ///
+    /// The rows are taken in three groups: the rows that are not used any
+    /// more go first, then the established rows, the weakest first, and the
+    /// fresh rows go last. A fresh row is protected as long as it is still
+    /// alive, otherwise a new feature could never take root in the mind.
     fn evictIfNeeded(&mut self) {
         if self.maxRows == 0 || self.rows.len() <= self.maxRows { return; }
         let target = self.maxRows * 9 / 10;
+        let dropCount = self.rows.len().saturating_sub(target);
+        if dropCount == 0 { return; }
+        let epoch = self.epoch;
         let mut victims: Vec<String> = Vec::new();
         {
-            let mut all: Vec<(u64, &String)> = self.rows.iter().map(|(k, r)| (r.hits, k)).collect();
-            let dropCount = all.len().saturating_sub(target);
-            if dropCount == 0 { return; }
-            all.select_nth_unstable_by(dropCount, |a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
-            for i in 0..dropCount { victims.push(all[i].1.clone()); }
+            let mut gone: Vec<(u64, &String)> = Vec::new();
+            let mut established: Vec<(u64, &String)> = Vec::new();
+            let mut fresh: Vec<(u64, &String)> = Vec::new();
+            for (key, row) in self.rows.iter() {
+                let age = epoch.saturating_sub(row.seen);
+                if age > FRESHGRACE { gone.push((row.hits, key)); }
+                else if row.uses >= MINHITS { established.push((row.hits, key)); }
+                else { fresh.push((row.uses, key)); }
+            }
+            takeWeakest(&mut gone, dropCount, &mut victims);
+            if victims.len() < dropCount {
+                let rest = dropCount - victims.len();
+                takeWeakest(&mut established, rest, &mut victims);
+            }
+            if victims.len() < dropCount {
+                let rest = dropCount - victims.len();
+                takeWeakest(&mut fresh, rest, &mut victims);
+            }
         }
         let dropped = victims.len() as u64;
         for key in victims { self.rows.remove(&key); }
         self.evicted += dropped;
     }
+    /// Old rows lose part of their strength, so that a new row can overtake
+    /// them and the mind does not stay frozen in the past. A row that was
+    /// used in the last window keeps its strength.
+    pub fn decayHits(&mut self) {
+        let epoch = self.epoch;
+        for row in self.rows.values_mut() {
+            if row.seen < epoch { row.hits = row.hits * HITDECAY / 10; }
+        }
+        self.epoch += 1;
+    }
     fn row(&mut self, feature: &str) -> &mut FeatureRow {
         self.rows.entry(feature.to_string()).or_insert_with(|| FeatureRow::new(self.cap))
     }
     pub fn write(&mut self, ctx: &Context, token: &str, passive: bool) {
-        for feature in contextFeatures(ctx) { self.row(&feature).bump(token, INCREMENT); }
+        let epoch = self.epoch;
+        for feature in contextFeatures(ctx) { self.row(&feature).bump(token, INCREMENT, epoch); }
         if passive { self.passiveWrites += 1; } else { self.consciousWrites += 1; }
         self.evictIfNeeded();
     }
@@ -250,6 +328,23 @@ impl Subconscious {
         }
         self.rebuildCommon();
     }
+    /// How often every token was seen as a target. Derived from the tables
+    /// themselves, so no separate vocabulary has to be kept in memory.
+    pub fn tokenFrequencies(&self) -> HashMap<String, u32> {
+        let mut freq: HashMap<String, u32> = HashMap::new();
+        for row in self.rows.values() {
+            for (token, weight) in &row.weights {
+                let count = (weight * 10.0).round() as u32;
+                if count > 0 { *freq.entry(token.clone()).or_insert(0) += count; }
+            }
+        }
+        freq
+    }
+    /// Rough memory of the tables of the subconscious.
+    pub fn bytes(&self) -> u64 {
+        let (rows, entries, _) = self.rowStats();
+        BYTES_ROW * rows as u64 + BYTES_ENTRY * entries as u64
+    }
     /// Diagnostics: (rows, entries, biggest row).
     pub fn rowStats(&self) -> (usize, usize, usize) {
         let mut entries = 0usize;
@@ -268,11 +363,13 @@ impl Subconscious {
             writeStr(out, token)?;
             writeU64(out, *count as u64)?;
         }
+        writeU64(out, self.epoch)?;
         writeU64(out, self.rows.len() as u64)?;
         for (feature, row) in &self.rows {
             writeStr(out, feature)?;
             writeF64(out, row.total)?;
             writeU64(out, row.hits)?;
+            writeU64(out, row.uses)?;
             writeU32(out, row.weights.len() as u32)?;
             for (token, weight) in &row.weights {
                 writeStr(out, token)?;
@@ -291,15 +388,20 @@ impl Subconscious {
             self.globalFreq.insert(token, count);
         }
         self.rows.clear();
+        let epoch = readU64(input)?;
+        self.epoch = epoch;
         let rows = readU64(input)?;
         for _ in 0..rows {
             let feature = readStr(input)?;
             let total = readF64(input)?;
             let hits = readU64(input)?;
+            let uses = readU64(input)?;
             let entries = readU32(input)?;
             let mut row = FeatureRow::new(self.cap);
             row.total = total;
             row.hits = hits;
+            row.uses = uses;
+            row.seen = epoch;
             for _ in 0..entries {
                 let token = readStr(input)?;
                 let weight = readF64(input)?;
@@ -320,12 +422,21 @@ impl Subconscious {
     pub fn consciousWrites(&self) -> u64 { self.consciousWrites }
 }
 
+/// The life of one conscious feature: how strong it is now (hits, it fades
+/// while the feature is not used), how often it was used in total (uses, it
+/// never fades) and when it was used the last time (seen, the epoch of the
+/// last write).
+#[derive(Clone, Copy, Default)]
+pub struct EdgeMeta { pub hits: u64, pub uses: u64, pub seen: u64 }
+
 pub struct Consciousness {
     globalFreq: HashMap<String, u32>, commonTokens: Vec<String>,
     edges: HashMap<String, HashMap<String, f64>>, totals: HashMap<String, f64>,
     edgeTop: HashMap<String, Vec<(String, f64)>>,
-    maxFeatures: usize, evicted: u64,
+    edgeMeta: HashMap<String, EdgeMeta>,
+    edgeCap: Option<f64>, maxFeatures: usize, evicted: u64, trimmed: u64,
     actions: u64, failedUpdates: u64,
+    epoch: u64,
 }
 
 /// Order of the conscious edges: heavier first, then the global frequency,
@@ -340,32 +451,88 @@ impl Consciousness {
     pub fn new(globalFreq: HashMap<String, u32>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), maxFeatures: 0, evicted: 0, actions: 0, failedUpdates: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), edgeMeta: HashMap::new(), edgeCap: Some(CAP), maxFeatures: 0, evicted: 0, trimmed: 0, actions: 0, failedUpdates: 0, epoch: 0 }
     }
     /// Upper bound for the number of features that keep conscious edges.
     /// 0 = no limit.
     pub fn setMaxFeatures(&mut self, maxFeatures: usize) { self.maxFeatures = maxFeatures; }
     pub fn evicted(&self) -> u64 { self.evicted }
-    /// Drops the least used features so that the memory stays bounded.
+    /// Drops the least useful features, so that the memory stays bounded.
+    /// A fresh feature is protected as long as it is still alive, so that a
+    /// new feature can take root.
     fn evictIfNeeded(&mut self) {
         if self.maxFeatures == 0 || self.edges.len() <= self.maxFeatures { return; }
         let target = self.maxFeatures * 9 / 10;
+        let dropCount = self.edges.len().saturating_sub(target);
+        if dropCount == 0 { return; }
+        let epoch = self.epoch;
         let mut victims: Vec<String> = Vec::new();
         {
-            // the total of a feature is proportional to the number of times
-            // it was updated, so it is the usage counter of the feature
-            let mut all: Vec<(u64, &String)> = self.edges.keys()
-                .map(|k| (*self.totals.get(k).unwrap_or(&0.0) as u64, k)).collect();
-            let dropCount = all.len().saturating_sub(target);
-            if dropCount == 0 { return; }
-            all.select_nth_unstable_by(dropCount, |a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
-            for i in 0..dropCount { victims.push(all[i].1.clone()); }
+            let mut gone: Vec<(u64, &String)> = Vec::new();
+            let mut established: Vec<(u64, &String)> = Vec::new();
+            let mut fresh: Vec<(u64, &String)> = Vec::new();
+            for key in self.edges.keys() {
+                let meta = self.edgeMeta.get(key).copied().unwrap_or_default();
+                let age = epoch.saturating_sub(meta.seen);
+                if age > FRESHGRACE { gone.push((meta.hits, key)); }
+                else if meta.uses >= MINHITS { established.push((meta.hits, key)); }
+                else { fresh.push((meta.uses, key)); }
+            }
+            takeWeakest(&mut gone, dropCount, &mut victims);
+            if victims.len() < dropCount {
+                let rest = dropCount - victims.len();
+                takeWeakest(&mut established, rest, &mut victims);
+            }
+            if victims.len() < dropCount {
+                let rest = dropCount - victims.len();
+                takeWeakest(&mut fresh, rest, &mut victims);
+            }
         }
         for key in victims {
             self.edges.remove(&key);
             self.totals.remove(&key);
             self.edgeTop.remove(&key);
+            self.edgeMeta.remove(&key);
             self.evicted += 1;
+        }
+    }
+    /// Old features lose part of their strength, so that a new feature can
+    /// overtake them and the mind does not stay frozen in the past. A feature
+    /// that was used in the last window keeps its strength.
+    pub fn decayHits(&mut self) {
+        let epoch = self.epoch;
+        for meta in self.edgeMeta.values_mut() {
+            if meta.seen < epoch { meta.hits = meta.hits * HITDECAY / 10; }
+        }
+        self.epoch += 1;
+    }
+    /// Caps the weight of the edges of one feature and cuts the weakest
+    /// continuations away, the same way the rows of the subconscious do. The
+    /// number of the edges of one feature is capped as well, so that a single
+    /// feature cannot eat the memory of the whole table.
+    fn trimEdges(&mut self, feature: &str) {
+        let cap = match self.edgeCap { Some(c) => c, None => return };
+        let total = *self.totals.get(feature).unwrap_or(&0.0);
+        let tooMany = self.edges.get(feature).map_or(0, |o| o.len()) > EDGECAP;
+        if total <= cap * 1.5 && !tooMany { return; }
+        let scale = if total > cap * 1.5 { cap / total } else { 1.0 };
+        let thr = cap * 0.0008;
+        if let Some(out) = self.edges.get_mut(feature) {
+            for w in out.values_mut() { *w *= scale; }
+            out.retain(|_, w| *w >= thr);
+            if out.len() > EDGECAP {
+                // only the strongest continuations stay
+                let mut list: Vec<(String, f64)> = out.iter().map(|(t, w)| (t.clone(), *w)).collect();
+                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+                let keep: HashSet<String> = list.iter().take(EDGECAP).map(|(t, _)| t.clone()).collect();
+                out.retain(|t, _| keep.contains(t));
+            }
+            let sum: f64 = out.values().sum();
+            self.totals.insert(feature.to_string(), sum);
+            self.edgeTop.remove(feature);
+            let targets: Vec<(String, f64)> = out.iter().map(|(t, w)| (t.clone(), *w)).collect();
+            for (target, weight) in targets { self.updateEdgeTop(feature, &target, weight); }
+            self.trimmed += 1;
         }
     }
     fn activeFeatures(&self, ctx: &Context, proposals: &[String]) -> Vec<String> {
@@ -375,6 +542,7 @@ impl Consciousness {
     }
     pub fn receiveTrainingTrigger(&mut self, work: &mut LinearWork, ctx: &Context, proposals: &[String], target: &str) -> bool {
         if !work.waitForSuccess() { self.failedUpdates += 1; return false; }
+        let epoch = self.epoch;
         for feature in self.activeFeatures(ctx, proposals) {
             let weight = {
                 let out = self.edges.entry(feature.clone()).or_default();
@@ -383,7 +551,14 @@ impl Consciousness {
                 *w
             };
             *self.totals.entry(feature.clone()).or_insert(0.0) += INCREMENT;
+            {
+                let meta = self.edgeMeta.entry(feature.clone()).or_default();
+                meta.hits += 1;
+                meta.uses += 1;
+                meta.seen = epoch;
+            }
             self.updateEdgeTop(&feature, target, weight);
+            self.trimEdges(&feature);
         }
         self.evictIfNeeded();
         true
@@ -461,6 +636,11 @@ impl Consciousness {
         // cached best continuations have to be rebuilt.
         self.edgeTop.clear();
     }
+    /// Rough memory of the tables of the consciousness.
+    pub fn bytes(&self) -> u64 {
+        let (features, edges, _) = self.edgeStats();
+        BYTES_ROW * features as u64 + BYTES_ENTRY * edges as u64
+    }
     /// Diagnostics: (features, edges, biggest feature).
     pub fn edgeStats(&self) -> (usize, usize, usize) {
         let mut edges = 0usize;
@@ -478,10 +658,14 @@ impl Consciousness {
             writeStr(out, token)?;
             writeU64(out, *count as u64)?;
         }
+        writeU64(out, self.epoch)?;
         writeU64(out, self.edges.len() as u64)?;
         for (feature, targets) in &self.edges {
             writeStr(out, feature)?;
             writeF64(out, *self.totals.get(feature).unwrap_or(&0.0))?;
+            let meta = self.edgeMeta.get(feature).copied().unwrap_or_default();
+            writeU64(out, meta.hits)?;
+            writeU64(out, meta.uses)?;
             writeU32(out, targets.len() as u32)?;
             for (target, weight) in targets {
                 writeStr(out, target)?;
@@ -502,10 +686,15 @@ impl Consciousness {
         self.edges.clear();
         self.totals.clear();
         self.edgeTop.clear();
+        self.edgeMeta.clear();
+        let epoch = readU64(input)?;
+        self.epoch = epoch;
         let features = readU64(input)?;
         for _ in 0..features {
             let feature = readStr(input)?;
             let total = readF64(input)?;
+            let hits = readU64(input)?;
+            let uses = readU64(input)?;
             let entries = readU32(input)?;
             let mut targets: HashMap<String, f64> = HashMap::with_capacity(entries as usize);
             for _ in 0..entries {
@@ -514,6 +703,7 @@ impl Consciousness {
                 targets.insert(target, weight);
             }
             self.totals.insert(feature.clone(), total);
+            self.edgeMeta.insert(feature.clone(), EdgeMeta { hits, uses, seen: epoch });
             for (target, weight) in &targets {
                 self.updateEdgeTop(&feature, target, *weight);
             }
@@ -592,7 +782,7 @@ mod tests {
         let mut rng = Rng(12345);
         for step in 0..4000 {
             let token = format!("t{}", rng.pick(40));
-            row.bump(&token, INCREMENT);
+            row.bump(&token, INCREMENT, 0);
             if step % 97 == 0 {
                 assert_eq!(row.top, row.bestEntries(), "row cache diverged at step {}", step);
             }
@@ -622,5 +812,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The rows that are not used any more are the first victims of the
+    /// eviction, so that the mind does not keep the past in memory.
+    #[test]
+    fn abandonedRowsGoFirst() {
+        let mut sub = Subconscious::new(HashMap::new(), Some(CAP));
+        sub.setMaxRows(10);
+        let hot = Context::withBag(vec!["hot".to_string()], Vec::new());
+        for _ in 0..10 { sub.write(&hot, "x", true); }
+        // the hot row is not used any more
+        for _ in 0..=FRESHGRACE { sub.decayHits(); }
+        // the table is filled with fresh rows
+        for i in 0..40 {
+            let ctx = Context::withBag(vec![format!("f{}", i)], Vec::new());
+            sub.write(&ctx, "z", true);
+        }
+        assert!(!sub.rows.contains_key("prev:hot"), "the abandoned row survived");
+        assert!(sub.rows.keys().any(|k| k.starts_with("prev:f")), "the fresh rows were dropped");
+    }
+
+    /// As long as a fresh row is alive it is not dropped: a new feature must
+    /// be able to take root in the mind.
+    #[test]
+    fn freshRowsAreProtected() {
+        let mut sub = Subconscious::new(HashMap::new(), Some(CAP));
+        sub.setMaxRows(10);
+        for i in 0..10 {
+            let ctx = Context::withBag(vec![format!("e{}", i)], Vec::new());
+            for _ in 0..5 { sub.write(&ctx, "x", true); }
+        }
+        let fresh = Context::withBag(vec!["a-fresh".to_string()], Vec::new());
+        sub.write(&fresh, "y", true);
+        // one more row over the limit starts the eviction
+        let extra = Context::withBag(vec!["extra".to_string()], Vec::new());
+        sub.write(&extra, "z", true);
+        assert!(sub.rows.contains_key("prev:a-fresh"), "the fresh row was dropped");
     }
 }

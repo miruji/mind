@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub const MAXBAG: usize = 6;
+/// Longest turn kept from the noisy support logs.
+pub const MAXTURNTOKENS: usize = 40;
 
 const STOP: &[&str] = &[
     "the", "and", "you", "that", "have", "for", "not", "with", "are", "but", "was", "were", "this",
@@ -86,9 +88,6 @@ pub fn contentWords(tokens: &[String]) -> Vec<String> {
     }
     out
 }
-
-/// Longest turn kept from the noisy support logs.
-pub const MAXTURNTOKENS: usize = 40;
 
 /// One Ubuntu IRC support log: `timestamp \t nick \t target \t message`.
 /// The files live in `dialogs/<group>/<file>.tsv`, there are about 1.8
@@ -258,11 +257,6 @@ pub struct SplitDialogs<I> {
 }
 
 impl<I> SplitDialogs<I> {
-    #[allow(dead_code)]
-    pub fn new(inner: I, holdEvery: u64, holdCap: usize) -> SplitDialogs<I> {
-        SplitDialogs { inner, counter: 0, holdEvery: holdEvery.max(1), holdCap, held: Vec::new() }
-    }
-
     /// Continues an interrupted run: the holdout pattern stays the same.
     pub fn at(inner: I, counter: u64, holdEvery: u64, holdCap: usize) -> SplitDialogs<I> {
         SplitDialogs { inner, counter, holdEvery: holdEvery.max(1), holdCap, held: Vec::new() }
@@ -281,24 +275,5 @@ impl<I: Iterator<Item = Dialogue>> Iterator for SplitDialogs<I> {
             }
             return Some(d);
         }
-    }
-}
-
-/// Counts every token that passes through, so that the mind can learn the
-/// vocabulary of a streamed corpus.
-pub struct CountingDialogs<I> { pub inner: I, pub freq: HashMap<String, u32> }
-
-impl<I> CountingDialogs<I> {
-    pub fn new(inner: I) -> CountingDialogs<I> { CountingDialogs { inner, freq: HashMap::new() } }
-}
-
-impl<I: Iterator<Item = Dialogue>> Iterator for CountingDialogs<I> {
-    type Item = Dialogue;
-    fn next(&mut self) -> Option<Dialogue> {
-        let d = self.inner.next()?;
-        for turn in &d.turns {
-            for t in turn { *self.freq.entry(t.clone()).or_insert(0) += 1; }
-        }
-        Some(d)
     }
 }
