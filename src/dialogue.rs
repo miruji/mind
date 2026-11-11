@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::corpus::{tokenizeDialogue, CorpusStatus, Dialogue, PromptModel};
 use crate::mind::{
     colorForFocus, colorForQuality, hitRate, makeWindow, resetColor, Consciousness, Context, Focus,
-    LinearWork, Subconscious, DLGWINDOW, PROPOSALCOUNT,
+    LinearWork, Subconscious, dlgWindow, PROPOSALCOUNT,
 };
 
 /// How often the training reports its progress.
@@ -116,7 +116,7 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
         for i in 1..d.turns.len() {
             let prompt = &d.turns[i - 1];
             let bag = promptModel.bag(prompt);
-            let mut history = makeWindow(prompt, DLGWINDOW);
+            let mut history = makeWindow(prompt, dlgWindow());
             let mut first = true;
             for t in &d.turns[i] {
                 let ctx = Context::withBag(history.clone(), bag.clone());
@@ -139,7 +139,7 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
                 if surprise { st.surprises += 1; }
                 if train {
                     sub.receiveObservation(&ctx, t);
-                    if surprise && work.unit() < focus.probability() {
+                    if surprise && work.waitForEvent().map_or(false, |g| g < focus.probability()) {
                         cons.receiveTrainingTrigger(work, &ctx, &props, t);
                         if let Some(chosen) = cons.chooseAction(work, &ctx, &props) {
                             sub.receiveConsciousAction(&ctx, &chosen);
@@ -223,14 +223,14 @@ pub fn generateReply(
     maxTokens: usize,
 ) -> String {
     let bag = promptModel.bag(prompt);
-    let mut history = makeWindow(prompt, DLGWINDOW);
+    let mut history = makeWindow(prompt, dlgWindow());
     let mut out = String::new();
     for _ in 0..maxTokens {
         let ctx = Context::withBag(history.clone(), bag.clone());
         let props = sub.top(&ctx, PROPOSALCOUNT);
         if props.is_empty() { break; }
         let mut chosen = props[0].clone();
-        if work.unit() < focus.probability() {
+        if work.waitForEvent().map_or(false, |g| g < focus.probability()) {
             if let Some(pick) = cons.chooseAction(work, &ctx, &props) { chosen = pick; }
         }
         sub.receiveConsciousAction(&ctx, &chosen);
@@ -429,7 +429,7 @@ fn printTop(sub: &Subconscious, cons: &Consciousness, promptModel: &PromptModel,
     if prompt.is_empty() { println!("(no prompt yet)"); return; }
     let bag = promptModel.bag(prompt);
     println!("bag   : {}", bag.join(", "));
-    let ctx = Context::withBag(makeWindow(prompt, DLGWINDOW), bag);
+    let ctx = Context::withBag(makeWindow(prompt, dlgWindow()), bag);
     let props = sub.top(&ctx, 5);
     let subScores = sub.scoreCandidates(&ctx, &props);
     let conScores = cons.scoreCandidates(&ctx, &props, &props);

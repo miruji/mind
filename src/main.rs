@@ -38,6 +38,7 @@ struct Options {
     maxReply: usize,
     save: Option<String>,
     load: Option<String>,
+    log: Option<String>,
     chat: bool,
 }
 
@@ -54,6 +55,7 @@ impl Options {
             maxReply: MAXREPLYTOKENS,
             save: None,
             load: None,
+            log: None,
             chat: true,
         };
         let args: Vec<String> = std::env::args().collect();
@@ -91,6 +93,30 @@ impl Options {
                 "--max-reply" => {
                     i += 1;
                     opts.maxReply = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(MAXREPLYTOKENS);
+                }
+                "--log" => {
+                    i += 1;
+                    opts.log = args.get(i).cloned();
+                }
+                "--window" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse::<usize>().ok()) { mind::WINDOW.store(v.clamp(1, 12), std::sync::atomic::Ordering::Relaxed); }
+                }
+                "--joint" => {
+                    i += 1;
+                    mind::JOINT.store(parseJoint(args.get(i).map(|x| x.as_str()).unwrap_or("")), std::sync::atomic::Ordering::Relaxed);
+                }
+                "--skip" => {
+                    i += 1;
+                    let _ = mind::SKIPS.set(parseSkips(args.get(i).map(|x| x.as_str()).unwrap_or("")));
+                }
+                "--confK" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse::<f64>().ok()) { mind::CONFK.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed); }
+                }
+                "--rowtake" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse::<usize>().ok()) { mind::ROWTAKEN.store(v.clamp(1, 256), std::sync::atomic::Ordering::Relaxed); }
                 }
                 "--save" => {
                     i += 1;
@@ -130,6 +156,47 @@ fn printReplyStats(label: &str, st: &ReplyStats) {
         st.candSize as f64 / st.steps.max(1) as f64);
 }
 
+fn parseJoint(list: &str) -> u32 {
+    let mut mask: u32 = 0;
+    for k in list.split(',') { if let Ok(k) = k.trim().parse::<u32>() { if (3..=8).contains(&k) { mask |= 1u32 << k; } } }
+    mask
+}
+
+fn parseSkips(list: &str) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for code in list.split(',') {
+        let c: Vec<char> = code.trim().chars().collect();
+        if c.len() == 2 { if let (Some(a), Some(b)) = (c[0].to_digit(10), c[1].to_digit(10)) { v.push((a as usize, b as usize)); } }
+    }
+    v
+}
+
+/// The feature set decides what the rows mean, so it is stored next to a checkpoint
+/// (`<file>.cfg`) and restored on --load: a chain of sessions must keep one set.
+fn featureConfig() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let joint: Vec<String> = (3..=8u32).filter(|k| mind::JOINT.load(Relaxed) & (1u32 << k) != 0).map(|k| k.to_string()).collect();
+    let skips: Vec<String> = mind::SKIPS.get().map(|v| v.iter().map(|(a, b)| format!("{}{}", a, b)).collect()).unwrap_or_default();
+    format!("window={} joint={} skip={} confK={} rowtake={}",
+        mind::dlgWindow(), joint.join(","), skips.join(","), f64::from_bits(mind::CONFK.load(Relaxed)), mind::rowTake())
+}
+
+fn applyFeatureConfig(text: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for part in text.split_whitespace() {
+        let mut kv = part.splitn(2, '=');
+        let (k, v) = (kv.next().unwrap_or(""), kv.next().unwrap_or(""));
+        match k {
+            "window" => { if let Ok(x) = v.parse::<usize>() { mind::WINDOW.store(x, Relaxed); } }
+            "joint" => mind::JOINT.store(parseJoint(v), Relaxed),
+            "skip" => { let _ = mind::SKIPS.set(parseSkips(v)); }
+            "confK" => { if let Ok(x) = v.parse::<f64>() { mind::CONFK.store(x.to_bits(), Relaxed); } }
+            "rowtake" => { if let Ok(x) = v.parse::<usize>() { mind::ROWTAKEN.store(x, Relaxed); } }
+            _ => {}
+        }
+    }
+}
+
 fn main() {
     let opts = Options::parse();
     let started = Instant::now();
@@ -163,6 +230,19 @@ fn main() {
     let mut focus = Focus::new();
     let mut cp = checkpoint::Checkpoint::default();
 
+    if let Some(path) = &opts.load {
+        let cfgPath = format!("{}.cfg", path);
+        match std::fs::read_to_string(&cfgPath) {
+            Ok(text) => {
+                let before = featureConfig();
+                applyFeatureConfig(&text);
+                println!("features restored from {}: {}", cfgPath, featureConfig());
+                if before != featureConfig() { println!("(command line features were replaced: a session chain must keep one feature set)"); }
+            }
+            Err(_) => println!("warning: {} not found, features come from the command line: {}", cfgPath, featureConfig()),
+        }
+    }
+    println!("features: {}", featureConfig());
     if let Some(path) = &opts.load {
         match checkpoint::load(Path::new(path), &mut sub, &mut cons) {
             Ok(loaded) => {
@@ -220,6 +300,7 @@ fn main() {
 
     // ================= quality on the held out part ========================
     let held = std::mem::take(&mut ubuntu.held);
+    let mut holdChunk = ReplyStats::default();
     if !held.is_empty() {
         let evalStats = dialogue::runReplies(
             held.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
@@ -227,6 +308,7 @@ fn main() {
         cp.holdout.merge(&evalStats);
         println!();
         printReplyStats("reply holdout (this chunk)", &evalStats);
+        holdChunk = evalStats;
     }
 
     // The vocabulary of the mind is taken from its own tables: no separate
@@ -263,6 +345,28 @@ fn main() {
             eta / 60.0, remaining, rate);
     }
 
+    // ================= one line per session ================================
+    if let Some(path) = &opts.log {
+        use std::io::Write;
+        let isNew = !Path::new(path).exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if isNew {
+                let _ = writeln!(f, "filesDone,filesThisSession,stepsThisSession,trainTop1,trainTop3,trainReach,surprisePct,willPct,holdTop1,holdTop3,holdReach,holdSurprisePct,rows,entries,features,edges,rssMb,tablesMb,evictedRows,focusFinal,seconds,features");
+            }
+            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 * 100.0 };
+            let (rows, entries, _) = sub.rowStats();
+            let (feats, edges, _) = cons.edgeStats();
+            let _ = writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{:.3},{:.0},{}",
+                cp.filesDone, cp.filesDone.saturating_sub(filesAtStart), stats.steps,
+                pct(stats.top1, stats.steps), pct(stats.top3, stats.steps), pct(stats.cand, stats.steps),
+                pct(stats.surprises, stats.steps), pct(stats.wills, stats.steps),
+                pct(holdChunk.top1, holdChunk.steps), pct(holdChunk.top3, holdChunk.steps), pct(holdChunk.cand, holdChunk.steps),
+                pct(holdChunk.surprises, holdChunk.steps), rows, entries, feats, edges,
+                dialogue::residentMb(), dialogue::mindBytes(&sub, &cons) / (1024 * 1024), sub.evicted(),
+                focus.level(), stageStart.elapsed().as_secs_f64(), featureConfig().replace(' ', ";"));
+        }
+    }
+
     // ================= checkpoint ===========================================
     if let Some(path) = &opts.save {
         match checkpoint::save(Path::new(path), &sub, &cons, &cp) {
@@ -270,6 +374,7 @@ fn main() {
                 let size = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
                 println!();
                 println!("checkpoint saved: {} ({} Mb), files done={}", path, size, cp.filesDone);
+                let _ = std::fs::write(format!("{}.cfg", path), featureConfig());
             }
             Err(err) => println!("cannot save checkpoint {}: {}", path, err),
         }

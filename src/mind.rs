@@ -2,6 +2,22 @@ use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+
+// ---- feature configuration (set once at start, kept in the checkpoint config) ----
+/// Size of the window: how many last words the system can take into account.
+pub static WINDOW: AtomicUsize = AtomicUsize::new(3);
+pub fn dlgWindow() -> usize { WINDOW.load(AtomicOrdering::Relaxed) }
+/// Joint features: bit k set adds the exact k-word window as one feature (`jK:a|b|c`).
+pub static JOINT: AtomicU32 = AtomicU32::new(0);
+/// Skip features: pairs of words at distances (a, b) from the predicted word, e.g. (1, 3)
+/// is "the last word and the one two before it" without the word between (`sAB:x|y`).
+pub static SKIPS: std::sync::OnceLock<Vec<(usize, usize)>> = std::sync::OnceLock::new();
+/// Evidence weighting of votes: a row with n observations votes with n / (n + K). 0 = off.
+pub static CONFK: AtomicU64 = AtomicU64::new(0);
+/// How many best entries each row exposes as candidates.
+pub static ROWTAKEN: AtomicUsize = AtomicUsize::new(8);
+#[inline] pub fn rowTake() -> usize { ROWTAKEN.load(AtomicOrdering::Relaxed) }
 
 use crate::binio::{readF64, readStr, readU32, readU64, writeF64, writeStr, writeU32, writeU64};
 
@@ -12,7 +28,7 @@ pub const INCREMENT: f64 = 0.1;
 pub const CAP: f64 = 24.0;
 pub const PROPOSALCOUNT: usize = 3;
 /// How many entries of a feature row are taken into the candidate set.
-pub const ROWTAKE: usize = 8;
+
 /// How many continuations of a feature are offered to the conscious choice.
 pub const EDGETAKE: usize = 3;
 /// How many edges one conscious feature may keep.
@@ -33,7 +49,7 @@ pub const BYTES_ENTRY: u64 = 96;
 pub const BYTES_PER_ROW: u64 = BYTES_ROW + 6 * BYTES_ENTRY;
 pub const BOS: &str = "<BOS>";
 /// Window size used by the dialogue phase.
-pub const DLGWINDOW: usize = 3;
+
 
 pub const FOCUSDECAY: f64 = 0.035;
 pub const FOCUSGAIN: f64 = 0.28;
@@ -54,15 +70,23 @@ pub fn nowNs() -> u64 {
 pub struct LinearWork { p1: f64, lastNs: u64, calls: u64, successes: u64, exhausted: u64 }
 impl LinearWork {
     pub fn new(p1: f64) -> Self { Self { p1, lastNs: 0, calls: 0, successes: 0, exhausted: 0 } }
-    pub fn waitForSuccess(&mut self) -> bool {
-        let p1 = self.p1; let low = 1.0 - p1; let mut lastNs = self.lastNs;
+    /// One linear work event. It returns `t` in [0, 1), the position of the
+    /// successful hash inside the window (1 - P1, P1). Given a success `t` is
+    /// uniform, so the same event pays for an act and also gives the dice of the
+    /// will: no second, unpaid read of the clock is needed.
+    pub fn waitForEvent(&mut self) -> Option<f64> {
+        let p1 = self.p1; let low = 1.0 - p1; let span = 2.0 * p1 - 1.0; let mut lastNs = self.lastNs;
         for attempt in 1..=RETRYLIMIT {
             let mut ns = nowNs(); if ns <= lastNs { ns = lastNs + 1; } lastNs = ns;
             let u = timeToUnit(ns);
-            if u < p1 && u > low { self.lastNs = lastNs; self.calls += attempt as u64; self.successes += 1; return true; }
+            if u < p1 && u > low {
+                self.lastNs = lastNs; self.calls += attempt as u64; self.successes += 1;
+                return Some(((u - low) / span).clamp(0.0, 0.999_999_999));
+            }
         }
-        self.lastNs = lastNs; self.calls += RETRYLIMIT as u64; self.exhausted += 1; false
+        self.lastNs = lastNs; self.calls += RETRYLIMIT as u64; self.exhausted += 1; None
     }
+    pub fn waitForSuccess(&mut self) -> bool { self.waitForEvent().is_some() }
     pub fn unit(&mut self) -> f64 {
         let mut ns = nowNs(); if ns <= self.lastNs { ns = self.lastNs + 1; } self.lastNs = ns; timeToUnit(ns)
     }
@@ -107,6 +131,17 @@ pub fn contextFeatures(ctx: &Context) -> Vec<String> {
         }
         for d in 3..=5 {
             if n >= d && ctx.win[n - d] != BOS { f.push(format!("prev{}:{}", d, ctx.win[n - d])); }
+        }
+    }
+    if let Some(skips) = SKIPS.get() {
+        for &(a, b) in skips {
+            if n >= b { f.push(format!("s{}{}:{}|{}", a, b, ctx.win[n - b], ctx.win[n - a])); }
+        }
+    }
+    let joint = JOINT.load(AtomicOrdering::Relaxed);
+    if joint != 0 {
+        for k in 3..=8usize {
+            if n >= k && joint & (1u32 << k) != 0 { f.push(format!("j{}:{}", k, ctx.win[n - k..].join("|"))); }
         }
     }
     for w in &ctx.bag { f.push(format!("bag:{}", w)); }
@@ -161,7 +196,7 @@ impl FeatureRow {
     fn updateTop(&mut self, token: &str, weight: f64) {
         if let Some(slot) = self.top.iter_mut().find(|(t, _)| t == token) {
             slot.1 = weight;
-        } else if self.top.len() < ROWTAKE {
+        } else if self.top.len() < rowTake() {
             self.top.push((token.to_string(), weight));
         } else {
             let weakest = self.top[self.top.len() - 1].clone();
@@ -182,7 +217,7 @@ impl FeatureRow {
     fn bestEntries(&self) -> Vec<(String, f64)> {
         let mut all: Vec<(String, f64)> = self.weights.iter().map(|(t, w)| (t.clone(), *w)).collect();
         all.sort_by(rowBetter);
-        all.truncate(ROWTAKE);
+        all.truncate(rowTake());
         all
     }
 }
@@ -277,10 +312,16 @@ impl Subconscious {
     pub fn receiveObservation(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, true); }
     pub fn receiveConsciousAction(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, false); }
     fn scoreToken(&self, features: &[String], token: &str) -> f64 {
+        let k = f64::from_bits(CONFK.load(AtomicOrdering::Relaxed));
         let mut s = 0.0;
         for feature in features {
             if let Some(row) = self.rows.get(feature) {
-                if let Some(w) = row.weights.get(token) { if row.total > 0.0 { s += w / row.total; } }
+                if let Some(w) = row.weights.get(token) {
+                    if row.total > 0.0 {
+                        let share = w / row.total;
+                        if k > 0.0 { let n = row.total / INCREMENT; s += share * n / (n + k); } else { s += share; }
+                    }
+                }
             }
         }
         s
@@ -610,7 +651,8 @@ impl Consciousness {
         scores
     }
     pub fn chooseAction(&mut self, work: &mut LinearWork, ctx: &Context, proposals: &[String]) -> Option<String> {
-        if !work.waitForSuccess() { self.failedUpdates += 1; return None; }
+        // The same linear work event pays for the act and gives the dice of the will.
+        let event = match work.waitForEvent() { Some(t) => t, None => { self.failedUpdates += 1; return None; } };
         let candidates = self.candidatePool(ctx, proposals, 3);
         let scores = self.scores(ctx, proposals, &candidates);
         let mut ranked = candidates;
@@ -618,7 +660,7 @@ impl Consciousness {
             .then(self.globalFreq.get(b).unwrap_or(&0).cmp(self.globalFreq.get(a).unwrap_or(&0))).then(a.cmp(b)));
         let chosen = if ranked.is_empty() {
             proposals.first().cloned().unwrap_or_default()
-        } else if work.unit() < 0.10 && ranked.len() > 1 { ranked[1].clone() } else { ranked[0].clone() };
+        } else if event < 0.10 && ranked.len() > 1 { ranked[1].clone() } else { ranked[0].clone() };
         self.actions += 1; Some(chosen)
     }
     /// Conscious score of an arbitrary candidate set (edges + proposal prior).
