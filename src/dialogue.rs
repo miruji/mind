@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::corpus::{tokenizeDialogue, CorpusStatus, Dialogue, PromptModel};
 use crate::mind::{
     colorForFocus, colorForQuality, hitRate, makeWindow, resetColor, Consciousness, Context, Focus,
-    LinearWork, Subconscious, dlgWindow, PROPOSALCOUNT,
+    LinearWork, Subconscious, dlgWindow, proposalsLimit,
 };
 
 /// How often the training reports its progress.
@@ -100,6 +100,7 @@ pub fn runReplies<I, D>(
     work: &mut LinearWork,
     focus: &mut Focus,
     train: bool,
+    limit: usize,
     limits: TrainLimits,
     status: Option<&CorpusStatus>,
     live: LiveOptions,
@@ -120,13 +121,22 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
             let mut first = true;
             for t in &d.turns[i] {
                 let ctx = Context::withBag(history.clone(), bag.clone());
-                let (props, cand) = sub.topWithCandidates(&ctx, PROPOSALCOUNT);
+                let (ranked, cand) = sub.rankedCandidates(&ctx);
+                // The quality is measured on the first three candidates, the
+                // conscious choice may look at all of them.
+                let top3 = sub.padWithCommon(ranked.iter().take(3).cloned().collect(), 3);
+                let mut props = if limit == 0 {
+                    ranked.clone()
+                } else {
+                    ranked.iter().take(limit).cloned().collect()
+                };
+                if props.is_empty() { props = sub.padWithCommon(Vec::new(), 3); }
                 st.steps += 1;
                 st.candSize += cand.len() as u64;
                 let reachable = cand.contains(t);
                 if reachable { st.cand += 1; }
-                let hit1 = props.first().map_or(false, |p| p == t);
-                let hit3 = props.contains(t);
+                let hit1 = top3.first().map_or(false, |p| p == t);
+                let hit3 = top3.contains(t);
                 if hit1 { st.top1 += 1; }
                 if hit3 { st.top3 += 1; }
                 if first {
@@ -187,7 +197,7 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
             let rss = residentMb();
             let tables = mindBytes(sub, cons) / (1024 * 1024);
             println!(
-                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, tables {}/{}Mb, rss {}Mb){}",
+                "  ... reply steps={} t1={:.1}% t3={:.1}% reach={:.1}% cands={:.0} ({:.1}s, tables {}/{}Mb, rss {}/{}Mb){}",
                 st.steps,
                 hitRate(st.top1, st.steps),
                 hitRate(st.top3, st.steps),
@@ -197,6 +207,7 @@ where I: Iterator<Item = D>, D: Borrow<Dialogue> {
                 tables,
                 limits.ramBudgetMb,
                 rss,
+                limits.ramBudgetMb,
                 corpusProgress(status, started));
             let _ = io::stdout().flush();
             nextProgress += PROGRESSSTEP;
@@ -221,13 +232,26 @@ pub fn generateReply(
     promptModel: &PromptModel,
     prompt: &[String],
     maxTokens: usize,
+    context: &[Vec<String>],
 ) -> String {
-    let bag = promptModel.bag(prompt);
+    // The topic of the dialogue: the words of the previous turns together
+    // with the words of the current prompt.
+    let mut topic: Vec<String> = Vec::new();
+    for turn in context { topic.extend(turn.iter().cloned()); }
+    topic.extend(prompt.iter().cloned());
+    let bag = promptModel.bag(&topic);
     let mut history = makeWindow(prompt, dlgWindow());
     let mut out = String::new();
+    let limit = proposalsLimit();
     for _ in 0..maxTokens {
         let ctx = Context::withBag(history.clone(), bag.clone());
-        let props = sub.top(&ctx, PROPOSALCOUNT);
+        let ranked = sub.rankedCandidates(&ctx).0;
+        let mut props = if limit == 0 {
+            ranked
+        } else {
+            ranked.into_iter().take(limit).collect()
+        };
+        if props.is_empty() { props = sub.padWithCommon(Vec::new(), 3); }
         if props.is_empty() { break; }
         let mut chosen = props[0].clone();
         if work.waitForEvent().map_or(false, |g| g < focus.probability()) {
@@ -274,10 +298,10 @@ fn fitMemory(
     if budgetMb == 0 { return; }
     let maxBytes = budgetMb * 1024 * 1024;
     let floorBytes = maxBytes / 10;
-    adjustTable(sub.bytes(), maxBytes / 2, floorBytes / 2, &mut state.sub, |limit| {
+    adjustTable(sub.rowStats().0, sub.bytes(), maxBytes / 2, floorBytes / 2, &mut state.sub, |limit| {
         sub.setMaxRows(limit);
     });
-    adjustTable(cons.bytes(), maxBytes / 2, floorBytes / 2, &mut state.cons, |limit| {
+    adjustTable(cons.edgeStats().0, cons.bytes(), maxBytes / 2, floorBytes / 2, &mut state.cons, |limit| {
         cons.setMaxFeatures(limit);
     });
 }
@@ -295,14 +319,19 @@ pub fn mindBytes(sub: &Subconscious, cons: &Consciousness) -> u64 {
 /// The limit never goes below the floor and it is not lowered again when the
 /// previous cleanup did not reduce the size.
 fn adjustTable(
+    rows: usize,
     bytes: u64,
     maxBytes: u64,
     floorBytes: u64,
     st: &mut TableState,
     mut set: impl FnMut(usize),
 ) {
-    let maxRows = (maxBytes / crate::mind::BYTES_PER_ROW).max(1) as usize;
-    let floorRows = ((floorBytes / crate::mind::BYTES_PER_ROW) as usize).max(1000);
+    // The real cost of one row: the row itself plus the entries it holds. It
+    // is measured, so the budget means what it says: the tables grow until they
+    // really fill it, and only then the weak rows are dropped.
+    let perRow = if rows > 0 { (bytes / rows as u64).max(1) } else { crate::mind::BYTES_PER_ROW };
+    let maxRows = (maxBytes / perRow).max(1) as usize;
+    let floorRows = ((floorBytes / perRow) as usize).max(1000);
     if bytes > maxBytes {
         if st.shrunk && bytes >= st.lastBytes {
             // the last cleanup did not help, do not squeeze the mind further
@@ -368,14 +397,18 @@ pub fn chatLoop(
     focus: &mut Focus,
     promptModel: &PromptModel,
     maxTokens: usize,
+    contextTurns: usize,
 ) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut lastPrompt: Vec<String> = Vec::new();
+    // The dialogue so far: the turns of the user and the turns of the mind.
+    // They give the mind the topic of the conversation.
+    let mut history: Vec<Vec<String>> = Vec::new();
     println!();
     println!("=== CHAT ===");
     println!("write a line and press enter - the mind continues with its own reply");
-    println!("commands: /quit  /help  /stats  /top");
+    println!("commands: /quit  /exit  /help  /stats  /top");
     loop {
         print!("\nyou> ");
         let _ = stdout.flush();
@@ -401,15 +434,24 @@ pub fn chatLoop(
         let prompt = tokenizeDialogue(&text);
         if prompt.is_empty() { continue; }
         lastPrompt = prompt.clone();
-        let reply = generateReply(sub, cons, work, focus, promptModel, &prompt, maxTokens);
+        let context: Vec<Vec<String>> = if contextTurns == 0 {
+            Vec::new()
+        } else {
+            let start = history.len().saturating_sub(contextTurns);
+            history[start..].to_vec()
+        };
+        let reply = generateReply(sub, cons, work, focus, promptModel, &prompt, maxTokens, &context);
         println!("mind> {}", reply);
         let _ = stdout.flush();
+        // the dialogue is remembered: the user turn and the turn of the mind
+        history.push(prompt.clone());
+        history.push(tokenizeDialogue(&reply));
     }
 }
 
 fn printHelp() {
     println!();
-    println!("/quit          leave the chat");
+    println!("/quit, /exit   leave the chat");
     println!("/stats         mind statistics");
     println!("/top           proposals for the last prompt");
 }

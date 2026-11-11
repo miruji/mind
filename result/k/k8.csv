@@ -1,0 +1,2 @@
+dialogsDone,dialogsThisPass,stepsThisPass,trainTop1,trainTop3,trainReach,surprisePct,willPct,holdTop1,holdTop3,holdReach,holdSurprisePct,rows,entries,features,edges,rssMb,tablesMb,evictedRows,focusFinal,seconds,features,pass
+10000,10000,279353,16.52,29.19,55.01,70.81,69.78,17.51,31.27,55.98,68.73,1148405,2145770,841104,1339732,1550,1290,0,1.000,35,window=6;joint=3,4,5,6;skip=;confK=8;rowtake=8,1

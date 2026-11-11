@@ -29,6 +29,10 @@ pub const CAP: f64 = 24.0;
 pub const PROPOSALCOUNT: usize = 3;
 /// How many entries of a feature row are taken into the candidate set.
 
+/// How many candidates the subconscious offers to the conscious choice.
+/// 0 = all of them (the whole candidate set of the context).
+pub static PROPOSALS: AtomicUsize = AtomicUsize::new(3);
+#[inline] pub fn proposalsLimit() -> usize { PROPOSALS.load(AtomicOrdering::Relaxed) }
 /// How many continuations of a feature are offered to the conscious choice.
 pub const EDGETAKE: usize = 3;
 /// How many edges one conscious feature may keep.
@@ -334,6 +338,15 @@ impl Subconscious {
     /// The proposals and the full candidate set behind them: a token outside
     /// of that set can never be hit, no matter how good the ranking is.
     pub fn topWithCandidates(&self, ctx: &Context, k: usize) -> (Vec<String>, HashSet<String>) {
+        let (ranked, cand) = self.rankedCandidates(ctx);
+        let mut out = self.padWithCommon(ranked, k);
+        out.truncate(k);
+        (out, cand)
+    }
+    /// Every candidate of the subconscious for this context, ranked. The set is
+    /// the union of the best continuations of all features of the context, so a
+    /// token outside of it can never be hit, no matter how good the ranking is.
+    pub fn rankedCandidates(&self, ctx: &Context) -> (Vec<String>, HashSet<String>) {
         let features = contextFeatures(ctx);
         let mut cand: HashSet<String> = HashSet::new();
         for feature in &features {
@@ -346,14 +359,17 @@ impl Subconscious {
         let mut ranked: Vec<String> = scores.keys().cloned().collect();
         ranked.sort_by(|a,b| scores[b].partial_cmp(&scores[a]).unwrap()
             .then(self.globalFreq.get(b).unwrap_or(&0).cmp(self.globalFreq.get(a).unwrap_or(&0))).then(a.cmp(b)));
+        (ranked, cand)
+    }
+    /// Fills a short list with the most common tokens of the mind.
+    pub fn padWithCommon(&self, mut ranked: Vec<String>, k: usize) -> Vec<String> {
         if ranked.len() < k {
             for t in &self.commonTokens {
-                if !scores.contains_key(t) { ranked.push(t.clone()); }
+                if !ranked.contains(t) { ranked.push(t.clone()); }
                 if ranked.len() >= k { break; }
             }
         }
-        ranked.truncate(k);
-        (ranked, cand)
+        ranked
     }
     /// Score of an arbitrary candidate set under the same rules as `top`.
     pub fn scoreCandidates(&self, ctx: &Context, cands: &[String]) -> Vec<(String, f64)> {

@@ -26,6 +26,8 @@ const MOVIE_HOLDCAP: usize = 2000;
 /// Memory budget of the mind in gigabytes.
 const RAMBUDGETGB: f64 = 8.0;
 const LIVESTEPS: u64 = 600;
+/// How many previous turns of the dialogue give the mind its topic.
+const CHATCONTEXT: usize = 3;
 const STEPDELAYMS: u64 = 20;
 
 struct Options {
@@ -42,6 +44,8 @@ struct Options {
     load: Option<String>,
     log: Option<String>,
     chat: bool,
+    chatOnly: bool,
+    chatContext: usize,
 }
 
 impl Options {
@@ -60,6 +64,8 @@ impl Options {
             load: None,
             log: None,
             chat: true,
+            chatOnly: false,
+            chatContext: CHATCONTEXT,
         };
         let args: Vec<String> = std::env::args().collect();
         let mut i = 1;
@@ -121,6 +127,10 @@ impl Options {
                     i += 1;
                     if let Some(v) = args.get(i).and_then(|v| v.parse::<f64>().ok()) { mind::CONFK.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed); }
                 }
+                "--proposals" => {
+                    i += 1;
+                    mind::PROPOSALS.store(args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+                }
                 "--rowtake" => {
                     i += 1;
                     if let Some(v) = args.get(i).and_then(|v| v.parse::<usize>().ok()) { mind::ROWTAKEN.store(v.clamp(1, 256), std::sync::atomic::Ordering::Relaxed); }
@@ -134,6 +144,11 @@ impl Options {
                     opts.load = args.get(i).cloned();
                 }
                 "--no-chat" => opts.chat = false,
+                "--chat-only" => { opts.chatOnly = true; opts.chat = true; }
+                "--chat-context" => {
+                    i += 1;
+                    opts.chatContext = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(CHATCONTEXT);
+                }
                 other => println!("unknown option: {}", other),
             }
             i += 1;
@@ -184,8 +199,8 @@ fn featureConfig() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let joint: Vec<String> = (3..=8u32).filter(|k| mind::JOINT.load(Relaxed) & (1u32 << k) != 0).map(|k| k.to_string()).collect();
     let skips: Vec<String> = mind::SKIPS.get().map(|v| v.iter().map(|(a, b)| format!("{}{}", a, b)).collect()).unwrap_or_default();
-    format!("window={} joint={} skip={} confK={} rowtake={}",
-        mind::dlgWindow(), joint.join(","), skips.join(","), f64::from_bits(mind::CONFK.load(Relaxed)), mind::rowTake())
+    format!("window={} joint={} skip={} confK={} rowtake={} proposals={}",
+        mind::dlgWindow(), joint.join(","), skips.join(","), f64::from_bits(mind::CONFK.load(Relaxed)), mind::rowTake(), mind::proposalsLimit())
 }
 
 fn applyFeatureConfig(text: &str) {
@@ -199,6 +214,7 @@ fn applyFeatureConfig(text: &str) {
             "skip" => { let _ = mind::SKIPS.set(parseSkips(v)); }
             "confK" => { if let Ok(x) = v.parse::<f64>() { mind::CONFK.store(x.to_bits(), Relaxed); } }
             "rowtake" => { if let Ok(x) = v.parse::<usize>() { mind::ROWTAKEN.store(x, Relaxed); } }
+            "proposals" => { if let Ok(x) = v.parse::<usize>() { mind::PROPOSALS.store(x, Relaxed); } }
             _ => {}
         }
     }
@@ -333,7 +349,7 @@ fn main() {
     let counterBase = cp.dialogsSeen;
     let mut position = rangeStart;
     let mut counter = counterBase;
-    for pass in 1..=opts.repeat {
+    for pass in 1..=if opts.chatOnly { 0 } else { opts.repeat } {
         let mut corpusStream = SplitDialogs::at(
             MovieDialogs::withLimit(corpus.clone(), rangeEnd, position),
             counter, MOVIE_HOLDOUT, MOVIE_HOLDCAP);
@@ -341,7 +357,7 @@ fn main() {
         status.chunkStart.set(position);
         let stats = dialogue::runReplies(
             &mut corpusStream, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
-            true,
+            true, mind::proposalsLimit(),
             TrainLimits { deadline, maxMb: opts.maxMb, ramBudgetMb },
             Some(&status),
             LiveOptions { steps: opts.steps, delayMs: opts.delay });
@@ -360,7 +376,7 @@ fn main() {
         if !held.is_empty() {
             let evalStats = dialogue::runReplies(
                 held.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
-                false, TrainLimits::default(), None, LiveOptions::default());
+                false, mind::proposalsLimit(), TrainLimits::default(), None, LiveOptions::default());
             cp.holdout.merge(&evalStats);
             println!();
             printReplyStats(&format!("reply holdout (pass {})", pass), &evalStats);
@@ -436,6 +452,7 @@ fn main() {
     // ================= chat =================================================
     if opts.chat {
         dialogue::chatLoop(
-            &mut sub, &mut cons, &mut work, &mut focus, &promptModel, opts.maxReply);
+            &mut sub, &mut cons, &mut work, &mut focus, &promptModel, opts.maxReply,
+            opts.chatContext);
     }
 }
