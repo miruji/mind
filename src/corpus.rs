@@ -1,9 +1,9 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub const MAXBAG: usize = 6;
@@ -208,15 +208,21 @@ pub struct MovieDialogs {
 
 impl MovieDialogs {
     pub fn new(corpus: Rc<MovieCorpus>) -> MovieDialogs {
-        MovieDialogs::withLimit(corpus, 0, 0)
+        let status = CorpusStatus::new();
+        MovieDialogs::withLimit(corpus, 0, 0, status)
     }
+
 
     /// `limit` caps the number of dialogs read from the start of the corpus
     /// (0 = all of them), `skip` ignores the dialogs that were already read in
     /// an earlier chunk. Both count from the same origin, so a chain of
     /// sessions with growing limits walks through the corpus once.
-    pub fn withLimit(corpus: Rc<MovieCorpus>, limit: u64, skip: u64) -> MovieDialogs {
-        let status = CorpusStatus::new();
+    pub fn withLimit(
+        corpus: Rc<MovieCorpus>,
+        limit: u64,
+        skip: u64,
+        status: CorpusStatus,
+    ) -> MovieDialogs {
         let total = countDialogs(&corpus);
         status.totalFiles.set(if limit > 0 { limit } else { total });
         MovieDialogs { corpus, convIdx: 0, read: 0, turns: 0, status, limit, skip }
@@ -248,6 +254,191 @@ impl Iterator for MovieDialogs {
             self.status.files.set(self.read);
             self.status.turns.set(self.turns);
             return Some(Dialogue { turns });
+        }
+    }
+}
+
+/// The subtitle corpus: one utterance per line, no speakers. A dialog is a
+/// block of consecutive lines, so every line is predicted from the line
+/// before it, exactly like a dialog of two speakers.
+///
+/// The position of the corpus is counted in lines, not in blocks: `--files
+/// 10000` means the first ten thousand lines of the file.
+pub struct SubtitleDialogs {
+    reader: BufReader<File>,
+    block: usize,
+    /// The lines of the block that is being filled: the absolute number of
+    /// the line and its tokens.
+    pending: Vec<(u64, Vec<String>)>,
+    /// Lines that were read from the file.
+    read: u64,
+    /// The position right after the last dialog that was returned.
+    done: u64,
+    pub turns: u64,
+    pub status: CorpusStatus,
+    total: u64,
+    limit: u64,
+    skip: u64,
+    eof: bool,
+}
+
+impl SubtitleDialogs {
+    pub fn new(path: &Path, block: usize, total: u64) -> std::io::Result<SubtitleDialogs> {
+        let status = CorpusStatus::new();
+        SubtitleDialogs::withLimit(path, block, total, 0, 0, status)
+    }
+
+    /// `limit` caps the number of lines read from the start of the corpus
+    /// (0 = all of them), `skip` ignores the lines that were already read in
+    /// an earlier chunk. Both count from the same origin, so a chain of
+    /// sessions with growing limits walks through the corpus once.
+    pub fn withLimit(
+        path: &Path,
+        block: usize,
+        total: u64,
+        limit: u64,
+        skip: u64,
+        status: CorpusStatus,
+    ) -> std::io::Result<SubtitleDialogs> {
+        let file = File::open(path)?;
+        status.totalFiles.set(if limit > 0 { limit } else { total });
+        Ok(SubtitleDialogs {
+            reader: BufReader::with_capacity(1 << 20, file),
+            block: block.max(2),
+            pending: Vec::new(),
+            read: 0,
+            done: 0,
+            turns: 0,
+            status,
+            total,
+            limit,
+            skip,
+            eof: false,
+        })
+    }
+
+    /// The number of lines of the corpus.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+}
+
+impl Iterator for SubtitleDialogs {
+    type Item = Dialogue;
+    fn next(&mut self) -> Option<Dialogue> {
+        loop {
+            while self.pending.len() < self.block {
+                if self.limit > 0 && self.read >= self.limit { break; }
+                if self.eof { break; }
+                let mut line = String::new();
+                match self.reader.read_line(&mut line) {
+                    Ok(0) => { self.eof = true; break; }
+                    Ok(_) => {}
+                    Err(_) => { self.eof = true; break; }
+                }
+                let index = self.read;
+                self.read += 1;
+                if index < self.skip {
+                    // the lines that are already done are only counted, they
+                    // are not even tokenized
+                    continue;
+                }
+                let tokens = tokenizeDialogue(line.trim());
+                if tokens.is_empty() { continue; }
+                self.pending.push((index, tokens));
+            }
+            if self.pending.is_empty() { return None; }
+            let block = std::mem::take(&mut self.pending);
+            if block.len() < 2 {
+                // a single line has no pair: it is left to the next session,
+                // which starts at the same place
+                continue;
+            }
+            self.done = block[block.len() - 1].0 + 1;
+            let turns: Vec<Vec<String>> = block.into_iter().map(|(_, t)| t).collect();
+            self.turns += turns.len() as u64;
+            self.status.files.set(self.done);
+            self.status.turns.set(self.turns);
+            return Some(Dialogue { turns });
+        }
+    }
+}
+
+/// Counts the lines of a file. The count is kept in a small file next to the
+/// corpus, so the next session does not have to read 13 Gb again.
+pub fn countLines(path: &Path) -> std::io::Result<u64> {
+    let meta = fs::metadata(path)?;
+    let len = meta.len();
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let cachePath = path.with_extension("lines");
+    if let Ok(text) = fs::read_to_string(&cachePath) {
+        let mut it = text.split_whitespace();
+        let cached: Option<u64> = it.next().and_then(|v| v.parse().ok());
+        let cachedLen: Option<u64> = it.next().and_then(|v| v.parse().ok());
+        let cachedMtime: Option<u64> = it.next().and_then(|v| v.parse().ok());
+        if cached.is_some() && cachedLen == Some(len) && cachedMtime == Some(mtime) {
+            return Ok(cached.unwrap());
+        }
+    }
+    let mut reader = BufReader::with_capacity(1 << 22, File::open(path)?);
+    let mut buf = vec![0u8; 1 << 22];
+    let mut lines = 0u64;
+    let mut last = b'\n';
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 { break; }
+        lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+        last = buf[n - 1];
+    }
+    if last != b'\n' { lines += 1; }
+    let _ = fs::write(&cachePath, format!("{}\n{}\n{}\n", lines, len, mtime));
+    Ok(lines)
+}
+
+/// The corpora the mind can be trained on.
+pub enum Source {
+    /// The Cornell Movie-Dialog Corpus: dialogs of two speakers.
+    Movie(Rc<MovieCorpus>),
+    /// Subtitles: one utterance per line, a dialog is a block of lines.
+    Subtitles { path: PathBuf, block: usize, total: u64 },
+}
+
+impl Source {
+    /// How many units the corpus holds (dialogs or lines).
+    pub fn total(&self) -> u64 {
+        match self {
+            Source::Movie(corpus) => countDialogs(corpus),
+            Source::Subtitles { total, .. } => *total,
+        }
+    }
+    /// The name of the unit that is counted: dialogs or lines.
+    pub fn unit(&self) -> &'static str {
+        match self {
+            Source::Movie(_) => "dialogs",
+            Source::Subtitles { .. } => "lines",
+        }
+    }
+    /// The stream of dialogs of the corpus.
+    pub fn stream(
+        &self,
+        status: CorpusStatus,
+        limit: u64,
+        skip: u64,
+    ) -> Box<dyn Iterator<Item = Dialogue>> {
+        match self {
+            Source::Movie(corpus) => Box::new(MovieDialogs::withLimit(
+                corpus.clone(), limit, skip, status)),
+            Source::Subtitles { path, block, total } => Box::new(
+                SubtitleDialogs::withLimit(path, *block, *total, limit, skip, status)
+                    .expect("subtitle corpus")),
+        }
+    }
+    /// The first dialogs of the corpus, used for the prompt model.
+    pub fn sample(&self, n: usize) -> Box<dyn Iterator<Item = Dialogue>> {
+        match self {
+            Source::Movie(corpus) => Box::new(MovieDialogs::new(corpus.clone()).take(n)),
+            Source::Subtitles { path, block, total } => Box::new(
+                SubtitleDialogs::new(path, *block, *total).expect("subtitle corpus").take(n)),
         }
     }
 }

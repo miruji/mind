@@ -466,7 +466,7 @@ fn printStats(sub: &Subconscious, cons: &Consciousness, focus: &Focus, work: &Li
         work.calls(), work.successes(), work.exhausted());
 }
 
-fn printTop(sub: &Subconscious, cons: &Consciousness, promptModel: &PromptModel, prompt: &[String]) {
+fn printTop(sub: &mut Subconscious, cons: &mut Consciousness, promptModel: &PromptModel, prompt: &[String]) {
     println!();
     if prompt.is_empty() { println!("(no prompt yet)"); return; }
     let bag = promptModel.bag(prompt);

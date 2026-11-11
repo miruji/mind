@@ -20,6 +20,7 @@ pub static ROWTAKEN: AtomicUsize = AtomicUsize::new(8);
 #[inline] pub fn rowTake() -> usize { ROWTAKEN.load(AtomicOrdering::Relaxed) }
 
 use crate::binio::{readF64, readStr, readU32, readU64, writeF64, writeStr, writeU32, writeU64};
+use crate::store::{hashFeature, SharedStore, Store, KIND_EDGE, KIND_ROW};
 
 pub const MASK: u64 = u64::MAX;
 pub const P1: f64 = 0.51; // Скорость симуляции, важно чтобы был 0.501 или как можно меньше, но для тестов можно и 0.51 для скорости, точность не падает сильно. но при большей скорости - нужно больше тестов.
@@ -226,6 +227,86 @@ impl FeatureRow {
     }
 }
 
+/// How many bytes of the long term memory may wait in the RAM before they
+/// are written into the file.
+pub const PENDINGFLUSH: usize = 32 << 20;
+
+/// The bytes of a row of the subconscious: the name of the feature, the
+/// strength of the row and its continuations.
+fn encodeRow(feature: &str, row: &FeatureRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    let _ = writeStr(&mut out, feature);
+    out.extend_from_slice(&row.total.to_le_bytes());
+    out.extend_from_slice(&row.hits.to_le_bytes());
+    out.extend_from_slice(&row.uses.to_le_bytes());
+    out.extend_from_slice(&row.seen.to_le_bytes());
+    out.extend_from_slice(&(row.weights.len() as u32).to_le_bytes());
+    for (token, weight) in &row.weights {
+        let _ = writeStr(&mut out, token);
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    out
+}
+
+/// A row of the subconscious from its bytes.
+fn decodeRow(bytes: &[u8]) -> Option<(String, FeatureRow)> {
+    let mut p = 0usize;
+    let feature = takeStr(bytes, &mut p)?;
+    let total = takeF64(bytes, &mut p)?;
+    let hits = takeU64(bytes, &mut p)?;
+    let uses = takeU64(bytes, &mut p)?;
+    let seen = takeU64(bytes, &mut p)?;
+    let entries = takeU32(bytes, &mut p)? as usize;
+    let mut row = FeatureRow::new(None);
+    row.total = total;
+    row.hits = hits;
+    row.uses = uses;
+    row.seen = seen;
+    for _ in 0..entries {
+        let token = takeStr(bytes, &mut p)?;
+        let weight = takeF64(bytes, &mut p)?;
+        row.weights.insert(token, weight);
+    }
+    row.rebuildTop();
+    Some((feature, row))
+}
+
+/// A string from a byte buffer.
+fn takeStr(bytes: &[u8], p: &mut usize) -> Option<String> {
+    let len = takeU32(bytes, p)? as usize;
+    if *p + len > bytes.len() { return None; }
+    let text = String::from_utf8_lossy(&bytes[*p..*p + len]).into_owned();
+    *p += len;
+    Some(text)
+}
+
+/// A number from a byte buffer.
+fn takeF64(bytes: &[u8], p: &mut usize) -> Option<f64> {
+    if *p + 8 > bytes.len() { return None; }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[*p..*p + 8]);
+    *p += 8;
+    Some(f64::from_le_bytes(buf))
+}
+
+/// A counter from a byte buffer.
+fn takeU64(bytes: &[u8], p: &mut usize) -> Option<u64> {
+    if *p + 8 > bytes.len() { return None; }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[*p..*p + 8]);
+    *p += 8;
+    Some(u64::from_le_bytes(buf))
+}
+
+/// A small counter from a byte buffer.
+fn takeU32(bytes: &[u8], p: &mut usize) -> Option<u32> {
+    if *p + 4 > bytes.len() { return None; }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[*p..*p + 4]);
+    *p += 4;
+    Some(u32::from_le_bytes(buf))
+}
+
 /// Takes the `n` weakest rows of the list (the smaller number first, the
 /// name as a tie breaker) and puts their names into the list of the victims.
 fn takeWeakest(list: &mut Vec<(u64, &String)>, n: usize, victims: &mut Vec<String>) {
@@ -244,20 +325,71 @@ pub struct Subconscious {
     /// The window of the training in which the rows are counted. It grows with
     /// every decay and it tells how long ago a row was used.
     epoch: u64,
+    /// The long term memory: the rows that left the window of the RAM.
+    store: Option<SharedStore>,
+    /// The rows that were raised from the long term memory. They are not
+    /// spilled again right away, otherwise the mind would write and read the
+    /// same row on every step.
+    protect: Vec<String>,
+    /// How many rows were raised from the long term memory.
+    raised: u64,
 }
 impl Subconscious {
     pub fn new(globalFreq: HashMap<String, u32>, cap: Option<f64>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0, maxRows: 0, evicted: 0, epoch: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), rows: HashMap::new(), cap, passiveWrites: 0, consciousWrites: 0, maxRows: 0, evicted: 0, epoch: 0, store: None, protect: Vec::new(), raised: 0 }
+    }
+    /// The long term memory of the mind. The rows that leave the window of
+    /// the RAM are written into it and raised from it when they come up.
+    pub fn setStore(&mut self, store: Option<SharedStore>) { self.store = store; }
+    /// How many rows were raised from the long term memory.
+    pub fn raised(&self) -> u64 { self.raised }
+    /// Raises the rows of the features that are not in the window from the
+    /// long term memory. A feature that the mind never knew stays unknown.
+    fn raise(&mut self, features: &[String]) {
+        let store = match &self.store { Some(s) => s.clone(), None => return };
+        let mut store = store.borrow_mut();
+        for feature in features {
+            if self.rows.contains_key(feature) { continue; }
+            let hash = hashFeature(feature);
+            let offset = match store.records.rows.get(&hash) { Some(o) => *o, None => continue };
+            let bytes = {
+                let Store { file, records, .. } = &mut *store;
+                match records.read(file, offset) { Ok(b) => b, Err(_) => continue }
+            };
+            if let Some((name, mut row)) = decodeRow(&bytes) {
+                if &name == feature {
+                    row.seen = self.epoch;
+                    self.rows.insert(feature.clone(), row);
+                    self.protect.push(feature.clone());
+                    self.raised += 1;
+                }
+            }
+        }
+    }
+    /// Writes a row into the long term memory: the row leaves the window of
+    /// the RAM, but it is not lost.
+    fn spill(&mut self, feature: &str, row: &FeatureRow) {
+        let store = match &self.store { Some(s) => s.clone(), None => return };
+        let mut store = store.borrow_mut();
+        if !store.writable() { return; }
+        let bytes = encodeRow(feature, row);
+        let hash = hashFeature(feature);
+        store.records.append(KIND_ROW, hash, &bytes);
+        if store.records.pending.len() > PENDINGFLUSH {
+            let Store { file, records, .. } = &mut *store;
+            let _ = records.flush(file);
+        }
     }
     /// Upper bound for the number of feature rows. When it is reached the
     /// least used rows are dropped, so the memory of the mind stays bounded
     /// on any corpus. 0 = no limit.
     pub fn setMaxRows(&mut self, maxRows: usize) { self.maxRows = maxRows; }
     pub fn evicted(&self) -> u64 { self.evicted }
-    /// Drops the least useful rows, so that the memory of the mind stays
-    /// bounded on any corpus.
+    /// Frees the place in the window of the RAM. The rows that leave it are
+    /// written into the long term memory: they are not lost, they wait there
+    /// until their feature comes up again.
     ///
     /// The rows are taken in three groups: the rows that are not used any
     /// more go first, then the established rows, the weakest first, and the
@@ -275,6 +407,7 @@ impl Subconscious {
             let mut established: Vec<(u64, &String)> = Vec::new();
             let mut fresh: Vec<(u64, &String)> = Vec::new();
             for (key, row) in self.rows.iter() {
+                if self.protect.iter().any(|p| p == key) { continue; }
                 let age = epoch.saturating_sub(row.seen);
                 if age > FRESHGRACE { gone.push((row.hits, key)); }
                 else if row.uses >= MINHITS { established.push((row.hits, key)); }
@@ -291,8 +424,11 @@ impl Subconscious {
             }
         }
         let dropped = victims.len() as u64;
-        for key in victims { self.rows.remove(&key); }
+        for key in victims {
+            if let Some(row) = self.rows.remove(&key) { self.spill(&key, &row); }
+        }
         self.evicted += dropped;
+        self.protect.clear();
     }
     /// Old rows lose part of their strength, so that a new row can overtake
     /// them and the mind does not stay frozen in the past. A row that was
@@ -309,9 +445,14 @@ impl Subconscious {
     }
     pub fn write(&mut self, ctx: &Context, token: &str, passive: bool) {
         let epoch = self.epoch;
-        for feature in contextFeatures(ctx) { self.row(&feature).bump(token, INCREMENT, epoch); }
+        let features = contextFeatures(ctx);
+        // a row that the mind knows but that is not in the window is raised
+        // first, so that the new observation lands on the old knowledge
+        self.raise(&features);
+        for feature in features { self.row(&feature).bump(token, INCREMENT, epoch); }
         if passive { self.passiveWrites += 1; } else { self.consciousWrites += 1; }
         self.evictIfNeeded();
+        self.protect.clear();
     }
     pub fn receiveObservation(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, true); }
     pub fn receiveConsciousAction(&mut self, ctx: &Context, token: &str) { self.write(ctx, token, false); }
@@ -330,14 +471,14 @@ impl Subconscious {
         }
         s
     }
-    pub fn top(&self, ctx: &Context, k: usize) -> Vec<String> {
+    pub fn top(&mut self, ctx: &Context, k: usize) -> Vec<String> {
         let (ranked, _) = self.topWithCandidates(ctx, k);
         ranked
     }
 
     /// The proposals and the full candidate set behind them: a token outside
     /// of that set can never be hit, no matter how good the ranking is.
-    pub fn topWithCandidates(&self, ctx: &Context, k: usize) -> (Vec<String>, HashSet<String>) {
+    pub fn topWithCandidates(&mut self, ctx: &Context, k: usize) -> (Vec<String>, HashSet<String>) {
         let (ranked, cand) = self.rankedCandidates(ctx);
         let mut out = self.padWithCommon(ranked, k);
         out.truncate(k);
@@ -346,8 +487,11 @@ impl Subconscious {
     /// Every candidate of the subconscious for this context, ranked. The set is
     /// the union of the best continuations of all features of the context, so a
     /// token outside of it can never be hit, no matter how good the ranking is.
-    pub fn rankedCandidates(&self, ctx: &Context) -> (Vec<String>, HashSet<String>) {
+    pub fn rankedCandidates(&mut self, ctx: &Context) -> (Vec<String>, HashSet<String>) {
         let features = contextFeatures(ctx);
+        // the rows that are not in the window are raised from the long term
+        // memory, otherwise their knowledge would be lost for the step
+        self.raise(&features);
         let mut cand: HashSet<String> = HashSet::new();
         for feature in &features {
             if let Some(row) = self.rows.get(feature) {
@@ -372,8 +516,9 @@ impl Subconscious {
         ranked
     }
     /// Score of an arbitrary candidate set under the same rules as `top`.
-    pub fn scoreCandidates(&self, ctx: &Context, cands: &[String]) -> Vec<(String, f64)> {
+    pub fn scoreCandidates(&mut self, ctx: &Context, cands: &[String]) -> Vec<(String, f64)> {
         let features = contextFeatures(ctx);
+        self.raise(&features);
         cands.iter().map(|t| (t.clone(), self.scoreToken(&features, t))).collect()
     }
     /// Additive vocabulary growth. A later phase may teach new words without
@@ -477,6 +622,16 @@ impl Subconscious {
     }
     pub fn passiveWrites(&self) -> u64 { self.passiveWrites }
     pub fn consciousWrites(&self) -> u64 { self.consciousWrites }
+    /// The counters of the mind that live in the header of the checkpoint.
+    pub fn counters(&self) -> (u64, u64, u64, u64) {
+        (self.passiveWrites, self.consciousWrites, self.evicted, self.raised)
+    }
+    pub fn setCounters(&mut self, passive: u64, conscious: u64, evicted: u64, raised: u64) {
+        self.passiveWrites = passive;
+        self.consciousWrites = conscious;
+        self.evicted = evicted;
+        self.raised = raised;
+    }
 }
 
 /// The life of one conscious feature: how strong it is now (hits, it fades
@@ -486,6 +641,41 @@ impl Subconscious {
 #[derive(Clone, Copy, Default)]
 pub struct EdgeMeta { pub hits: u64, pub uses: u64, pub seen: u64 }
 
+/// The bytes of the edges of one feature of the consciousness.
+fn encodeEdges(feature: &str, targets: &HashMap<String, f64>, total: f64, meta: EdgeMeta) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    let _ = writeStr(&mut out, feature);
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&meta.hits.to_le_bytes());
+    out.extend_from_slice(&meta.uses.to_le_bytes());
+    out.extend_from_slice(&meta.seen.to_le_bytes());
+    out.extend_from_slice(&(targets.len() as u32).to_le_bytes());
+    for (target, weight) in targets {
+        let _ = writeStr(&mut out, target);
+        out.extend_from_slice(&weight.to_le_bytes());
+    }
+    out
+}
+
+/// The edges of one feature from their bytes.
+fn decodeEdges(bytes: &[u8]) -> Option<(String, HashMap<String, f64>, f64, EdgeMeta)> {
+    let mut p = 0usize;
+    let feature = takeStr(bytes, &mut p)?;
+    let total = takeF64(bytes, &mut p)?;
+    let hits = takeU64(bytes, &mut p)?;
+    let uses = takeU64(bytes, &mut p)?;
+    let seen = takeU64(bytes, &mut p)?;
+    let count = takeU32(bytes, &mut p)? as usize;
+    if count > bytes.len() { return None; }
+    let mut targets: HashMap<String, f64> = HashMap::new();
+    for _ in 0..count {
+        let target = takeStr(bytes, &mut p)?;
+        let weight = takeF64(bytes, &mut p)?;
+        targets.insert(target, weight);
+    }
+    Some((feature, targets, total, EdgeMeta { hits, uses, seen }))
+}
+
 pub struct Consciousness {
     globalFreq: HashMap<String, u32>, commonTokens: Vec<String>,
     edges: HashMap<String, HashMap<String, f64>>, totals: HashMap<String, f64>,
@@ -494,6 +684,12 @@ pub struct Consciousness {
     edgeCap: Option<f64>, maxFeatures: usize, evicted: u64, trimmed: u64,
     actions: u64, failedUpdates: u64,
     epoch: u64,
+    /// The long term memory: the features that left the window of the RAM.
+    store: Option<SharedStore>,
+    /// The features that were raised from the long term memory.
+    protect: Vec<String>,
+    /// How many features were raised from the long term memory.
+    raised: u64,
 }
 
 /// Order of the conscious edges: heavier first, then the global frequency,
@@ -508,13 +704,64 @@ impl Consciousness {
     pub fn new(globalFreq: HashMap<String, u32>) -> Self {
         let mut common: Vec<_> = globalFreq.iter().map(|(k,v)| (k.clone(),*v)).collect();
         common.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), edgeMeta: HashMap::new(), edgeCap: Some(CAP), maxFeatures: 0, evicted: 0, trimmed: 0, actions: 0, failedUpdates: 0, epoch: 0 }
+        Self { globalFreq, commonTokens: common.into_iter().map(|(k,_)|k).collect(), edges: HashMap::new(), totals: HashMap::new(), edgeTop: HashMap::new(), edgeMeta: HashMap::new(), edgeCap: Some(CAP), maxFeatures: 0, evicted: 0, trimmed: 0, actions: 0, failedUpdates: 0, epoch: 0, store: None, protect: Vec::new(), raised: 0 }
+    }
+    /// The long term memory of the mind. The features that leave the window
+    /// of the RAM are written into it and raised from it when they come up.
+    pub fn setStore(&mut self, store: Option<SharedStore>) { self.store = store; }
+    /// How many features were raised from the long term memory.
+    pub fn raised(&self) -> u64 { self.raised }
+    /// Raises the features that are not in the window from the long term
+    /// memory. A feature that the mind never knew stays unknown.
+    fn raise(&mut self, features: &[String]) {
+        let store = match &self.store { Some(s) => s.clone(), None => return };
+        let mut store = store.borrow_mut();
+        for feature in features {
+            if self.edges.contains_key(feature) { continue; }
+            let hash = hashFeature(feature);
+            let offset = match store.records.edges.get(&hash) { Some(o) => *o, None => continue };
+            let bytes = {
+                let Store { file, records, .. } = &mut *store;
+                match records.read(file, offset) { Ok(b) => b, Err(_) => continue }
+            };
+            if let Some((name, targets, total, mut meta)) = decodeEdges(&bytes) {
+                if &name == feature {
+                    meta.seen = self.epoch;
+                    self.totals.insert(name.clone(), total);
+                    self.edgeMeta.insert(name.clone(), meta);
+                    for (target, weight) in &targets { self.updateEdgeTop(&name, target, *weight); }
+                    self.edges.insert(name.clone(), targets);
+                    self.protect.push(name);
+                    self.raised += 1;
+                }
+            }
+        }
+    }
+    /// Writes the edges of one feature into the long term memory: the feature
+    /// leaves the window of the RAM, but it is not lost.
+    fn spill(&mut self, feature: &str) {
+        let store = match &self.store { Some(s) => s.clone(), None => return };
+        let mut store = store.borrow_mut();
+        if !store.writable() { return; }
+        let targets = match self.edges.get(feature) { Some(t) => t.clone(), None => return };
+        let total = *self.totals.get(feature).unwrap_or(&0.0);
+        let meta = self.edgeMeta.get(feature).copied().unwrap_or_default();
+        let bytes = encodeEdges(feature, &targets, total, meta);
+        let hash = hashFeature(feature);
+        store.records.append(KIND_EDGE, hash, &bytes);
+        if store.records.pending.len() > PENDINGFLUSH {
+            let Store { file, records, .. } = &mut *store;
+            let _ = records.flush(file);
+        }
     }
     /// Upper bound for the number of features that keep conscious edges.
     /// 0 = no limit.
     pub fn setMaxFeatures(&mut self, maxFeatures: usize) { self.maxFeatures = maxFeatures; }
     pub fn evicted(&self) -> u64 { self.evicted }
-    /// Drops the least useful features, so that the memory stays bounded.
+    /// Frees the place in the window of the RAM. The features that leave it
+    /// are written into the long term memory: they are not lost, they wait
+    /// there until they come up again.
+    ///
     /// A fresh feature is protected as long as it is still alive, so that a
     /// new feature can take root.
     fn evictIfNeeded(&mut self) {
@@ -529,6 +776,7 @@ impl Consciousness {
             let mut established: Vec<(u64, &String)> = Vec::new();
             let mut fresh: Vec<(u64, &String)> = Vec::new();
             for key in self.edges.keys() {
+                if self.protect.iter().any(|p| p == key) { continue; }
                 let meta = self.edgeMeta.get(key).copied().unwrap_or_default();
                 let age = epoch.saturating_sub(meta.seen);
                 if age > FRESHGRACE { gone.push((meta.hits, key)); }
@@ -546,12 +794,14 @@ impl Consciousness {
             }
         }
         for key in victims {
+            self.spill(&key);
             self.edges.remove(&key);
             self.totals.remove(&key);
             self.edgeTop.remove(&key);
             self.edgeMeta.remove(&key);
             self.evicted += 1;
         }
+        self.protect.clear();
     }
     /// Old features lose part of their strength, so that a new feature can
     /// overtake them and the mind does not stay frozen in the past. A feature
@@ -600,7 +850,11 @@ impl Consciousness {
     pub fn receiveTrainingTrigger(&mut self, work: &mut LinearWork, ctx: &Context, proposals: &[String], target: &str) -> bool {
         if !work.waitForSuccess() { self.failedUpdates += 1; return false; }
         let epoch = self.epoch;
-        for feature in self.activeFeatures(ctx, proposals) {
+        let features = self.activeFeatures(ctx, proposals);
+        // a feature that the mind knows but that is not in the window is
+        // raised first, so that the new edge lands on the old knowledge
+        self.raise(&features);
+        for feature in features {
             let weight = {
                 let out = self.edges.entry(feature.clone()).or_default();
                 let w = out.entry(target.to_string()).or_insert(0.0);
@@ -618,6 +872,7 @@ impl Consciousness {
             self.trimEdges(&feature);
         }
         self.evictIfNeeded();
+        self.protect.clear();
         true
     }
     /// Keeps the best EDGETAKE continuations of a feature up to date.
@@ -669,6 +924,8 @@ impl Consciousness {
     pub fn chooseAction(&mut self, work: &mut LinearWork, ctx: &Context, proposals: &[String]) -> Option<String> {
         // The same linear work event pays for the act and gives the dice of the will.
         let event = match work.waitForEvent() { Some(t) => t, None => { self.failedUpdates += 1; return None; } };
+        let features = self.activeFeatures(ctx, proposals);
+        self.raise(&features);
         let candidates = self.candidatePool(ctx, proposals, 3);
         let scores = self.scores(ctx, proposals, &candidates);
         let mut ranked = candidates;
@@ -680,7 +937,9 @@ impl Consciousness {
         self.actions += 1; Some(chosen)
     }
     /// Conscious score of an arbitrary candidate set (edges + proposal prior).
-    pub fn scoreCandidates(&self, ctx: &Context, proposals: &[String], cands: &[String]) -> Vec<(String, f64)> {
+    pub fn scoreCandidates(&mut self, ctx: &Context, proposals: &[String], cands: &[String]) -> Vec<(String, f64)> {
+        let features = self.activeFeatures(ctx, proposals);
+        self.raise(&features);
         let scores = self.scores(ctx, proposals, cands);
         cands.iter().map(|t| (t.clone(), *scores.get(t).unwrap_or(&0.0))).collect()
     }
@@ -777,6 +1036,16 @@ impl Consciousness {
     }
     pub fn actions(&self) -> u64 { self.actions }
     pub fn failedUpdates(&self) -> u64 { self.failedUpdates }
+    /// The counters of the mind that live in the header of the checkpoint.
+    pub fn counters(&self) -> (u64, u64, u64, u64) {
+        (self.actions, self.failedUpdates, self.evicted, self.raised)
+    }
+    pub fn setCounters(&mut self, actions: u64, failed: u64, evicted: u64, raised: u64) {
+        self.actions = actions;
+        self.failedUpdates = failed;
+        self.evicted = evicted;
+        self.raised = raised;
+    }
 }
 
 pub struct Focus {

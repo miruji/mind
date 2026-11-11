@@ -6,19 +6,24 @@ mod checkpoint;
 mod corpus;
 mod dialogue;
 mod mind;
+mod store;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use corpus::{countDialogs, MovieCorpus, MovieDialogs, PromptModel, SplitDialogs};
+use corpus::{countLines, CorpusStatus, MovieCorpus, PromptModel, Source, SplitDialogs};
 use dialogue::{LiveOptions, ReplyStats, TrainLimits};
 use mind::{
     hitRate, Focus, LinearWork, Subconscious, CAP, FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD, P1,
 };
+use store::{SharedStore, Store};
 
 const MOVIE_ROOT: &str = "data/data";
+const SUBTITLE_PATH: &str = "data/en.txt";
+const SUBTITLE_BLOCK: usize = 4;
 const MAXREPLYTOKENS: usize = 24;
 const MOVIE_SAMPLE: usize = 4000;
 const MOVIE_HOLDOUT: u64 = 10;
@@ -46,6 +51,9 @@ struct Options {
     chat: bool,
     chatOnly: bool,
     chatContext: usize,
+    corpus: String,
+    subtitlePath: String,
+    block: usize,
 }
 
 impl Options {
@@ -66,6 +74,9 @@ impl Options {
             chat: true,
             chatOnly: false,
             chatContext: CHATCONTEXT,
+            corpus: "auto".to_string(),
+            subtitlePath: SUBTITLE_PATH.to_string(),
+            block: SUBTITLE_BLOCK,
         };
         let args: Vec<String> = std::env::args().collect();
         let mut i = 1;
@@ -148,6 +159,18 @@ impl Options {
                 "--chat-context" => {
                     i += 1;
                     opts.chatContext = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(CHATCONTEXT);
+                }
+                "--corpus" => {
+                    i += 1;
+                    opts.corpus = args.get(i).cloned().unwrap_or_else(|| "auto".to_string());
+                }
+                "--subtitles" => {
+                    i += 1;
+                    opts.subtitlePath = args.get(i).cloned().unwrap_or_else(|| SUBTITLE_PATH.to_string());
+                }
+                "--block" => {
+                    i += 1;
+                    opts.block = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(SUBTITLE_BLOCK).max(2);
                 }
                 other => println!("unknown option: {}", other),
             }
@@ -258,25 +281,53 @@ fn main() {
     let opts = Options::parse();
     let started = Instant::now();
 
-    let root = Path::new(MOVIE_ROOT);
-    if !root.exists() {
-        println!("corpus not found: {}", MOVIE_ROOT);
-        return;
-    }
-    let corpus = match MovieCorpus::load(root) {
-        Ok(c) => Rc::new(c),
-        Err(err) => {
-            println!("cannot read corpus {}: {}", MOVIE_ROOT, err);
+    // The corpus of the run: the subtitles or the movie dialogs. The
+    // subtitles are counted in lines, the movie corpus in dialogs.
+    let subtitlePath = Path::new(&opts.subtitlePath);
+    let useSubs = match opts.corpus.as_str() {
+        "subs" | "subtitles" => true,
+        "movie" => false,
+        _ => subtitlePath.exists(),
+    };
+    let source = if useSubs {
+        if !subtitlePath.exists() {
+            println!("corpus not found: {}", opts.subtitlePath);
             return;
         }
+        let counting = Instant::now();
+        let total = match countLines(subtitlePath) {
+            Ok(t) => t,
+            Err(err) => {
+                println!("cannot read corpus {}: {}", opts.subtitlePath, err);
+                return;
+            }
+        };
+        println!(
+            "corpus {}: {} lines, a dialog is a block of {} lines ({:.1}s)",
+            opts.subtitlePath, total, opts.block, counting.elapsed().as_secs_f64());
+        Source::Subtitles { path: subtitlePath.to_path_buf(), block: opts.block, total }
+    } else {
+        let root = Path::new(MOVIE_ROOT);
+        if !root.exists() {
+            println!("corpus not found: {}", MOVIE_ROOT);
+            return;
+        }
+        match MovieCorpus::load(root) {
+            Ok(c) => Source::Movie(Rc::new(c)),
+            Err(err) => {
+                println!("cannot read corpus {}: {}", MOVIE_ROOT, err);
+                return;
+            }
+        }
     };
+    let unit = source.unit();
 
-    println!("CORPUS={}", MOVIE_ROOT);
+    println!("CORPUS={}", if useSubs { opts.subtitlePath.clone() } else { MOVIE_ROOT.to_string() });
     println!("Live focus: decay={} gain={} threshold={}", FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD);
     println!("color: red=asleep → green=high focus | · passive  ! surprise  W will");
     println!("stats: t1/t3 = subconscious Top1/Top3 hit rate on the true next token");
-    let totalDialogs = if opts.files > 0 { opts.files } else { countDialogs(&corpus) };
-    println!("dialogs in corpus: {} (utterances {})", totalDialogs, corpus.utterances);
+    let totalDialogs = if opts.files > 0 { opts.files } else { source.total() };
+    println!("{} in corpus: {}", unit, totalDialogs);
     if opts.minutes > 0 {
         println!("budget: {} min", opts.minutes);
     } else {
@@ -294,6 +345,51 @@ fn main() {
     let mut focus = Focus::new();
     let mut cp = checkpoint::Checkpoint::default();
 
+    // The long term memory of the mind: the file of the checkpoint. The rows
+    // that leave the window of the RAM are written into it and raised from
+    // it when their feature comes up again.
+    let memoryPath: Option<std::path::PathBuf> = opts.save.clone().map(std::path::PathBuf::from);
+    let readOnly = memoryPath.is_none();
+    let store: SharedStore = match &memoryPath {
+        Some(p) => {
+            if let Some(loadPath) = &opts.load {
+                if Path::new(loadPath) != p.as_path() && Path::new(loadPath).exists() {
+                    println!("the memory {} is copied to {}", loadPath, p.display());
+                    if let Err(err) = store::copyMemory(Path::new(loadPath), p) {
+                        println!("cannot copy the memory: {}", err);
+                        return;
+                    }
+                }
+            }
+            match Store::open(p) {
+                Ok(s) => Rc::new(RefCell::new(s)),
+                Err(err) => {
+                    println!("cannot open the memory {}: {}", p.display(), err);
+                    return;
+                }
+            }
+        }
+        None => {
+            let p = match &opts.load {
+                Some(l) => std::path::PathBuf::from(l),
+                None => {
+                    println!("no memory file: the rows of the mind are lost when they leave the window");
+                    std::path::PathBuf::from("data/runs/mind.bin")
+                }
+            };
+            match Store::open(&p) {
+                Ok(s) => Rc::new(RefCell::new(s)),
+                Err(err) => {
+                    println!("cannot open the memory {}: {}", p.display(), err);
+                    return;
+                }
+            }
+        }
+    };
+    store.borrow_mut().setWritable(!readOnly);
+    sub.setStore(Some(store.clone()));
+    cons.setStore(Some(store.clone()));
+
     if let Some(path) = &opts.load {
         let cfgPath = format!("{}.cfg", path);
         match std::fs::read_to_string(&cfgPath) {
@@ -308,15 +404,18 @@ fn main() {
     }
     println!("features: {}", featureConfig());
     if let Some(path) = &opts.load {
-        match checkpoint::load(Path::new(path), &mut sub, &mut cons) {
+        match checkpoint::load(Path::new(path), &mut sub, &mut cons, &store) {
             Ok(loaded) => {
                 cp = loaded;
                 println!();
                 println!("--- resumed from {} ---", path);
-                println!("dialogs done={} seen={} steps done={}",
-                    cp.dialogsDone, cp.dialogsSeen, cp.train.steps);
-                println!("mind: rows={} features={} edges={}",
-                    sub.rowStats().0, cons.edgeStats().0, cons.edgeStats().1);
+                println!("{} done={} seen={} steps done={}",
+                    unit, cp.dialogsDone, cp.dialogsSeen, cp.train.steps);
+                println!("mind: rows={} features={}",
+                    sub.rowStats().0, cons.edgeStats().0);
+                println!("long term memory: records={} index rows={} features={}",
+                    store.borrow().records.len(), store.borrow().records.rows.len(),
+                    store.borrow().records.edges.len());
             }
             Err(err) => {
                 println!("cannot read checkpoint {}: {}", path, err);
@@ -327,7 +426,7 @@ fn main() {
 
     // The prompt model only needs the discriminative words of the corpus, it
     // is collected in one pass over a small sample and then thrown away.
-    let sample = MovieDialogs::new(corpus.clone()).take(opts.sample);
+    let sample = source.sample(opts.sample);
     let promptModel = PromptModel::build(sample);
     println!("prompt model: {} dialogs sampled", opts.sample);
 
@@ -345,16 +444,16 @@ fn main() {
     // is read again and again: the holdout stays the same every pass, so the
     // passes can be compared with each other.
     let rangeStart = cp.dialogsDone;
-    let rangeEnd = if opts.files > 0 { opts.files } else { countDialogs(&corpus) };
+    let rangeEnd = if opts.files > 0 { opts.files } else { source.total() };
     let counterBase = cp.dialogsSeen;
     let mut position = rangeStart;
     let mut counter = counterBase;
     for pass in 1..=if opts.chatOnly { 0 } else { opts.repeat } {
-        let mut corpusStream = SplitDialogs::at(
-            MovieDialogs::withLimit(corpus.clone(), rangeEnd, position),
-            counter, MOVIE_HOLDOUT, MOVIE_HOLDCAP);
-        let status = corpusStream.inner.status.clone();
+        let status = CorpusStatus::new();
         status.chunkStart.set(position);
+        let mut corpusStream = SplitDialogs::at(
+            source.stream(status.clone(), rangeEnd, position),
+            counter, MOVIE_HOLDOUT, MOVIE_HOLDCAP);
         let stats = dialogue::runReplies(
             &mut corpusStream, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
             true, mind::proposalsLimit(),
@@ -362,13 +461,13 @@ fn main() {
             Some(&status),
             LiveOptions { steps: opts.steps, delayMs: opts.delay });
         cp.train.merge(&stats);
-        let read = corpusStream.inner.read;
+        let read = status.files.get();
         let seen = corpusStream.counter;
         println!();
         printReplyStats(&format!("reply (pass {})", pass), &stats);
         println!(
-            "dialogs read={} seen={} turns={} ({:.1}s)",
-            read, seen, corpusStream.inner.turns, started.elapsed().as_secs_f64());
+            "{} read={} seen={} turns={} ({:.1}s)",
+            unit, read, seen, status.turns.get(), started.elapsed().as_secs_f64());
 
         // ================= quality on the held out part ====================
         let held = std::mem::take(&mut corpusStream.held);
@@ -412,7 +511,7 @@ fn main() {
     println!("=== RESULT ===");
     printReplyStats("reply total", &cp.train);
     printReplyStats("reply holdout total", &cp.holdout);
-    println!("dialogs done={} of {}", cp.dialogsDone, totalDialogs);
+    println!("{} done={} of {}", unit, cp.dialogsDone, totalDialogs);
     println!(
         "focus final={:.3} fades={} avgConsciousness={:.1}%",
         focus.level(), focus.fades(), focus.avgPercent());
@@ -427,22 +526,32 @@ fn main() {
     println!("stage took {:.1}s", started.elapsed().as_secs_f64());
     println!("memory: {} Mb rss, {} Mb of tables", dialogue::residentMb(), dialogue::mindBytes(&sub, &cons) / (1024 * 1024));
     println!("forgotten: rows={} features={}", sub.evicted(), cons.evicted());
+    println!("raised from disk: rows={} features={}", sub.raised(), cons.raised());
+    {
+        let store = store.borrow();
+        println!(
+            "long term memory: {} Mb of records ({} Mb waiting), index rows={} features={}",
+            store.records.len() / (1024 * 1024),
+            store.records.pending.len() / (1024 * 1024),
+            store.records.rows.len(),
+            store.records.edges.len());
+    }
     {
         let elapsed = stageStart.elapsed().as_secs_f64().max(0.001);
         let rate = (cp.dialogsDone.saturating_sub(filesAtStart)) as f64 / elapsed;
         let remaining = totalDialogs.saturating_sub(cp.dialogsDone);
         let eta = remaining as f64 / rate.max(0.0001);
-        println!("eta to the end of the corpus: {:.0} min ({} dialogs left, {:.0} dialogs/s)",
-            eta / 60.0, remaining, rate);
+        println!("eta to the end of the corpus: {:.0} min ({} {} left, {:.0} {}/s)",
+            eta / 60.0, remaining, unit, rate, unit);
     }
 
     // ================= checkpoint ===========================================
     if let Some(path) = &opts.save {
-        match checkpoint::save(Path::new(path), &sub, &cons, &cp) {
+        match checkpoint::save(Path::new(path), &mut sub, &mut cons, &cp, &store) {
             Ok(()) => {
                 let size = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
                 println!();
-                println!("checkpoint saved: {} ({} Mb), dialogs done={}", path, size, cp.dialogsDone);
+                println!("checkpoint saved: {} ({} Mb), {} done={}", path, size, unit, cp.dialogsDone);
                 let _ = std::fs::write(format!("{}.cfg", path), featureConfig());
             }
             Err(err) => println!("cannot save checkpoint {}: {}", path, err),
