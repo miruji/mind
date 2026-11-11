@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 pub const MAXBAG: usize = 6;
@@ -89,39 +89,84 @@ pub fn contentWords(tokens: &[String]) -> Vec<String> {
     out
 }
 
-/// One Ubuntu IRC support log: `timestamp \t nick \t target \t message`.
-/// The files live in `dialogs/<group>/<file>.tsv`, there are about 1.8
-/// million of them, so they are read one by one and never kept in memory.
-pub fn readUbuntuFile(path: &Path) -> Option<Dialogue> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::with_capacity(1 << 16, file);
-    let mut turns: Vec<Vec<String>> = Vec::new();
-    let mut currentKey: Option<(String, String)> = None;
-    let mut current: Vec<String> = Vec::new();
-    for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
-        if line.is_empty() { continue; }
-        let mut parts = line.splitn(4, '\t');
-        let _stamp = parts.next().unwrap_or("");
-        let nick = parts.next().unwrap_or("").trim().to_string();
-        let target = parts.next().unwrap_or("").trim().to_string();
-        let message = parts.next().unwrap_or("");
-        if nick.is_empty() && target.is_empty() { continue; }
-        let key = (nick, target);
-        if currentKey.as_ref() != Some(&key) {
-            if !current.is_empty() { turns.push(std::mem::take(&mut current)); }
-            currentKey = Some(key);
+/// The Cornell Movie-Dialog Corpus lives in two plain text files:
+/// `movie_lines.txt` keeps every utterance, `movie_conversations.txt` keeps
+/// which utterances form one dialog. The fields are separated by ` +++$+++ `.
+pub const MOVIESEP: &str = " +++$+++ ";
+
+/// The whole corpus in memory: the utterances and the dialogs they form.
+pub struct MovieCorpus {
+    /// Text of every utterance, in the order of `movie_lines.txt`.
+    texts: Vec<String>,
+    /// `L1045` -> index in `texts`.
+    index: HashMap<String, u32>,
+    /// Dialogues: the utterances of each dialog, in order.
+    pub conversations: Vec<Vec<u32>>,
+    pub utterances: usize,
+}
+
+impl MovieCorpus {
+    pub fn load(dir: &Path) -> std::io::Result<MovieCorpus> {
+        let mut corpus = MovieCorpus {
+            texts: Vec::new(),
+            index: HashMap::new(),
+            conversations: Vec::new(),
+            utterances: 0,
+        };
+        // pass 1: the utterances
+        // The files are read byte by byte: a few lines of the corpus hold
+        // latin-1 characters, and they must not stop the reading.
+        let mut reader = BufReader::with_capacity(1 << 20, fs::File::open(dir.join("movie_lines.txt"))?);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 { break; }
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.trim().is_empty() { continue; }
+            let mut parts = line.splitn(5, MOVIESEP);
+            let id = parts.next().unwrap_or("").trim().to_string();
+            let _character = parts.next();
+            let _movie = parts.next();
+            let _name = parts.next();
+            let text = parts.next().unwrap_or("").trim().to_string();
+            if id.is_empty() || text.is_empty() { continue; }
+            let idx = corpus.texts.len() as u32;
+            corpus.texts.push(text);
+            corpus.index.insert(id, idx);
         }
-        let tokens = tokenizeDialogue(message);
-        if tokens.is_empty() { continue; }
-        for t in tokens {
-            if current.len() >= MAXTURNTOKENS { break; }
-            current.push(t);
+        corpus.utterances = corpus.texts.len();
+        // pass 2: the dialogs
+        let mut reader = BufReader::with_capacity(1 << 20, fs::File::open(dir.join("movie_conversations.txt"))?);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 { break; }
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.trim().is_empty() { continue; }
+            let mut parts = line.splitn(4, MOVIESEP);
+            parts.next();
+            parts.next();
+            parts.next();
+            let list = parts.next().unwrap_or("");
+            let mut conv: Vec<u32> = Vec::new();
+            for raw in list.trim().trim_start_matches('[').trim_end_matches(']').split(',') {
+                let id = raw.trim().trim_matches('\'').trim_matches('"');
+                if id.is_empty() { continue; }
+                if let Some(&i) = corpus.index.get(id) { conv.push(i); }
+            }
+            if conv.len() >= 2 { corpus.conversations.push(conv); }
         }
+        Ok(corpus)
     }
-    if !current.is_empty() { turns.push(current); }
-    if turns.len() < 2 { return None; }
-    Some(Dialogue { turns })
+
+    /// Text of one utterance.
+    pub fn text(&self, idx: u32) -> &str {
+        self.texts.get(idx as usize).map(|s| s.as_str()).unwrap_or("")
+    }
 }
 
 /// Shared progress counters of a streamed corpus.
@@ -145,30 +190,15 @@ impl CorpusStatus {
     }
 }
 
-/// Counts the files of the whole tree without reading them (fast enough for
-/// 1.8 million entries and it gives an exact ETA).
-pub fn countFiles(root: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() { continue; }
-            if let Ok(files) = fs::read_dir(&path) {
-                for file in files.flatten() {
-                    if file.path().extension().map(|e| e == "tsv").unwrap_or(false) { total += 1; }
-                }
-            }
-        }
-    }
-    total
+/// Counts the dialogs of the whole corpus.
+pub fn countDialogs(corpus: &MovieCorpus) -> u64 {
+    corpus.conversations.len() as u64
 }
 
-/// Streaming reader over the whole Ubuntu support log tree.
-pub struct UbuntuDialogs {
-    dirs: Vec<PathBuf>,
-    dirIdx: usize,
-    files: Vec<PathBuf>,
-    fileIdx: usize,
+/// Streams the dialogs of the movie corpus.
+pub struct MovieDialogs {
+    corpus: Rc<MovieCorpus>,
+    convIdx: usize,
     pub read: u64,
     pub turns: u64,
     pub status: CorpusStatus,
@@ -176,73 +206,48 @@ pub struct UbuntuDialogs {
     skip: u64,
 }
 
-impl UbuntuDialogs {
-    pub fn new(root: &Path) -> UbuntuDialogs {
-        UbuntuDialogs::withLimit(root, 0, 0)
+impl MovieDialogs {
+    pub fn new(corpus: Rc<MovieCorpus>) -> MovieDialogs {
+        MovieDialogs::withLimit(corpus, 0, 0)
     }
 
-    /// `limit` caps the number of files (0 = the whole corpus),
-    /// `skip` ignores the files that were already read in an earlier chunk.
-    pub fn withLimit(root: &Path, limit: u64, skip: u64) -> UbuntuDialogs {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Ok(entries) = fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() { dirs.push(path); }
-            }
-        }
-        dirs.sort();
+    /// `limit` caps the number of dialogs read from the start of the corpus
+    /// (0 = all of them), `skip` ignores the dialogs that were already read in
+    /// an earlier chunk. Both count from the same origin, so a chain of
+    /// sessions with growing limits walks through the corpus once.
+    pub fn withLimit(corpus: Rc<MovieCorpus>, limit: u64, skip: u64) -> MovieDialogs {
         let status = CorpusStatus::new();
-        let total = countFiles(root);
+        let total = countDialogs(&corpus);
         status.totalFiles.set(if limit > 0 { limit } else { total });
-        UbuntuDialogs { dirs, dirIdx: 0, files: Vec::new(), fileIdx: 0, read: 0, turns: 0, status, limit, skip }
-    }
-
-    fn loadDir(&mut self) -> bool {
-        while self.dirIdx < self.dirs.len() {
-            let dir = &self.dirs[self.dirIdx];
-            self.dirIdx += 1;
-            let mut files: Vec<PathBuf> = Vec::new();
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "tsv").unwrap_or(false) { files.push(path); }
-                }
-            }
-            if files.is_empty() { continue; }
-            files.sort();
-            self.files = files;
-            self.fileIdx = 0;
-            return true;
-        }
-        self.files.clear();
-        self.fileIdx = 0;
-        false
+        MovieDialogs { corpus, convIdx: 0, read: 0, turns: 0, status, limit, skip }
     }
 }
 
-impl Iterator for UbuntuDialogs {
+impl Iterator for MovieDialogs {
     type Item = Dialogue;
     fn next(&mut self) -> Option<Dialogue> {
         loop {
             if self.limit > 0 && self.read >= self.limit { return None; }
-            if self.fileIdx >= self.files.len() {
-                if !self.loadDir() { return None; }
-            }
-            let path = self.files[self.fileIdx].clone();
-            self.fileIdx += 1;
+            if self.convIdx >= self.corpus.conversations.len() { return None; }
+            let conv = &self.corpus.conversations[self.convIdx];
+            self.convIdx += 1;
             self.read += 1;
             if self.skip > 0 {
                 self.skip -= 1;
                 self.status.files.set(self.read);
                 continue;
             }
-            if let Some(d) = readUbuntuFile(&path) {
-                self.turns += d.turns.len() as u64;
-                self.status.files.set(self.read);
-                self.status.turns.set(self.turns);
-                return Some(d);
+            let mut turns: Vec<Vec<String>> = Vec::new();
+            for &line in conv {
+                let tokens = tokenizeDialogue(self.corpus.text(line));
+                if tokens.is_empty() { continue; }
+                turns.push(tokens.into_iter().take(MAXTURNTOKENS).collect());
             }
+            if turns.len() < 2 { continue; }
+            self.turns += turns.len() as u64;
+            self.status.files.set(self.read);
+            self.status.turns.set(self.turns);
+            return Some(Dialogue { turns });
         }
     }
 }

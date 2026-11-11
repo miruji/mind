@@ -11,14 +11,14 @@ use crate::dialogue::ReplyStats;
 use crate::mind::{Consciousness, Subconscious};
 
 const MAGIC: &[u8; 8] = b"MINDCKPT";
-const VERSION: u64 = 2;
+const VERSION: u64 = 3;
 
 /// Everything that has to survive between two chunks.
 pub struct Checkpoint {
-    /// Files of the streamed corpus that were already read.
-    pub filesDone: u64,
+    /// Dialogues of the streamed corpus that were already read.
+    pub dialogsDone: u64,
     /// Dialogues of the streamed corpus that were already seen.
-    pub dialoguesDone: u64,
+    pub dialogsSeen: u64,
     /// Training statistics of the corpus so far.
     pub train: ReplyStats,
     /// Statistics of the held out part so far.
@@ -28,8 +28,8 @@ pub struct Checkpoint {
 impl Default for Checkpoint {
     fn default() -> Checkpoint {
         Checkpoint {
-            filesDone: 0,
-            dialoguesDone: 0,
+            dialogsDone: 0,
+            dialogsSeen: 0,
             train: ReplyStats::default(),
             holdout: ReplyStats::default(),
         }
@@ -74,8 +74,8 @@ pub fn save(
     let mut out = BufWriter::with_capacity(1 << 20, file);
     out.write_all(MAGIC)?;
     writeU64(&mut out, VERSION)?;
-    writeU64(&mut out, cp.filesDone)?;
-    writeU64(&mut out, cp.dialoguesDone)?;
+    writeU64(&mut out, cp.dialogsDone)?;
+    writeU64(&mut out, cp.dialogsSeen)?;
     saveStats(&mut out, &cp.train)?;
     saveStats(&mut out, &cp.holdout)?;
     sub.save(&mut out)?;
@@ -103,8 +103,8 @@ pub fn load(
             std::io::ErrorKind::InvalidData, format!("unsupported checkpoint version {}", version)));
     }
     let mut cp = Checkpoint::default();
-    cp.filesDone = readU64(&mut input)?;
-    cp.dialoguesDone = readU64(&mut input)?;
+    cp.dialogsDone = readU64(&mut input)?;
+    cp.dialogsSeen = readU64(&mut input)?;
     cp.train = loadStats(&mut input)?;
     cp.holdout = loadStats(&mut input)?;
     sub.load(&mut input)?;

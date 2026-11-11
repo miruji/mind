@@ -9,19 +9,20 @@ mod mind;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use corpus::{countFiles, PromptModel, SplitDialogs, UbuntuDialogs};
+use corpus::{countDialogs, MovieCorpus, MovieDialogs, PromptModel, SplitDialogs};
 use dialogue::{LiveOptions, ReplyStats, TrainLimits};
 use mind::{
     hitRate, Focus, LinearWork, Subconscious, CAP, FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD, P1,
 };
 
-const UBUNTU_ROOT: &str = "data/ubuntu_dialogs/dialogs";
+const MOVIE_ROOT: &str = "data/data";
 const MAXREPLYTOKENS: usize = 24;
-const UBUNTU_SAMPLE: usize = 4000;
-const UBUNTU_HOLDOUT: u64 = 10;
-const UBUNTU_HOLDCAP: usize = 2000;
+const MOVIE_SAMPLE: usize = 4000;
+const MOVIE_HOLDOUT: u64 = 10;
+const MOVIE_HOLDCAP: usize = 2000;
 /// Memory budget of the mind in gigabytes.
 const RAMBUDGETGB: f64 = 8.0;
 const LIVESTEPS: u64 = 600;
@@ -30,8 +31,9 @@ const STEPDELAYMS: u64 = 20;
 struct Options {
     steps: u64,
     minutes: u64,
-    ubuntuFiles: u64,
-    ubuntuSample: usize,
+    files: u64,
+    sample: usize,
+    repeat: u32,
     maxMb: u64,
     ramGb: f64,
     delay: u64,
@@ -47,8 +49,9 @@ impl Options {
         let mut opts = Options {
             steps: LIVESTEPS,
             minutes: 1,
-            ubuntuFiles: 0,
-            ubuntuSample: UBUNTU_SAMPLE,
+            files: 0,
+            sample: MOVIE_SAMPLE,
+            repeat: 1,
             maxMb: 0,
             ramGb: RAMBUDGETGB,
             delay: STEPDELAYMS,
@@ -70,13 +73,17 @@ impl Options {
                     i += 1;
                     opts.minutes = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1);
                 }
-                "--ubuntu-files" => {
+                "--files" | "--ubuntu-files" => {
                     i += 1;
-                    opts.ubuntuFiles = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    opts.files = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
                 }
-                "--ubuntu-sample" => {
+                "--repeat" => {
                     i += 1;
-                    opts.ubuntuSample = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(UBUNTU_SAMPLE);
+                    opts.repeat = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+                }
+                "--sample" | "--ubuntu-sample" => {
+                    i += 1;
+                    opts.sample = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(MOVIE_SAMPLE);
                 }
                 "--max-mb" => {
                     i += 1;
@@ -197,22 +204,63 @@ fn applyFeatureConfig(text: &str) {
     }
 }
 
+/// One line per pass in the session log.
+fn writeSessionRow(
+    path: Option<&str>,
+    pass: u32,
+    stats: &ReplyStats,
+    hold: &ReplyStats,
+    sub: &mind::Subconscious,
+    cons: &mind::Consciousness,
+    focus: &mind::Focus,
+    from: u64,
+    to: u64,
+    seconds: f64,
+) {
+    let path = match path { Some(p) => p, None => return };
+    use std::io::Write;
+    let isNew = !Path::new(path).exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if isNew {
+            let _ = writeln!(f, "dialogsDone,dialogsThisPass,stepsThisPass,trainTop1,trainTop3,trainReach,surprisePct,willPct,holdTop1,holdTop3,holdReach,holdSurprisePct,rows,entries,features,edges,rssMb,tablesMb,evictedRows,focusFinal,seconds,features,pass");
+        }
+        let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 * 100.0 };
+        let (rows, entries, _) = sub.rowStats();
+        let (feats, edges, _) = cons.edgeStats();
+        let _ = writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{:.3},{:.0},{},{}",
+            to, to.saturating_sub(from), stats.steps,
+            pct(stats.top1, stats.steps), pct(stats.top3, stats.steps), pct(stats.cand, stats.steps),
+            pct(stats.surprises, stats.steps), pct(stats.wills, stats.steps),
+            pct(hold.top1, hold.steps), pct(hold.top3, hold.steps), pct(hold.cand, hold.steps),
+            pct(hold.surprises, hold.steps), rows, entries, feats, edges,
+            dialogue::residentMb(), dialogue::mindBytes(sub, cons) / (1024 * 1024), sub.evicted(),
+            focus.level(), seconds, featureConfig().replace(' ', ";"), pass);
+    }
+}
+
 fn main() {
     let opts = Options::parse();
     let started = Instant::now();
 
-    let root = Path::new(UBUNTU_ROOT);
+    let root = Path::new(MOVIE_ROOT);
     if !root.exists() {
-        println!("corpus not found: {}", UBUNTU_ROOT);
+        println!("corpus not found: {}", MOVIE_ROOT);
         return;
     }
+    let corpus = match MovieCorpus::load(root) {
+        Ok(c) => Rc::new(c),
+        Err(err) => {
+            println!("cannot read corpus {}: {}", MOVIE_ROOT, err);
+            return;
+        }
+    };
 
-    println!("CORPUS={}", UBUNTU_ROOT);
+    println!("CORPUS={}", MOVIE_ROOT);
     println!("Live focus: decay={} gain={} threshold={}", FOCUSDECAY, FOCUSGAIN, FOCUSTHRESHOLD);
     println!("color: red=asleep → green=high focus | · passive  ! surprise  W will");
     println!("stats: t1/t3 = subconscious Top1/Top3 hit rate on the true next token");
-    let totalFiles = if opts.ubuntuFiles > 0 { opts.ubuntuFiles } else { countFiles(root) };
-    println!("files in corpus: {}", totalFiles);
+    let totalDialogs = if opts.files > 0 { opts.files } else { countDialogs(&corpus) };
+    println!("dialogs in corpus: {} (utterances {})", totalDialogs, corpus.utterances);
     if opts.minutes > 0 {
         println!("budget: {} min", opts.minutes);
     } else {
@@ -249,8 +297,8 @@ fn main() {
                 cp = loaded;
                 println!();
                 println!("--- resumed from {} ---", path);
-                println!("files done={} dialogues done={} steps done={}",
-                    cp.filesDone, cp.dialoguesDone, cp.train.steps);
+                println!("dialogs done={} seen={} steps done={}",
+                    cp.dialogsDone, cp.dialogsSeen, cp.train.steps);
                 println!("mind: rows={} features={} edges={}",
                     sub.rowStats().0, cons.edgeStats().0, cons.edgeStats().1);
             }
@@ -263,9 +311,9 @@ fn main() {
 
     // The prompt model only needs the discriminative words of the corpus, it
     // is collected in one pass over a small sample and then thrown away.
-    let sample = UbuntuDialogs::new(root).take(opts.ubuntuSample);
+    let sample = MovieDialogs::new(corpus.clone()).take(opts.sample);
     let promptModel = PromptModel::build(sample);
-    println!("prompt model: {} files sampled", opts.ubuntuSample);
+    println!("prompt model: {} dialogs sampled", opts.sample);
 
     // ================= one common stage on the corpus =======================
     println!();
@@ -275,41 +323,68 @@ fn main() {
     } else {
         None
     };
-    let filesAtStart = cp.filesDone;
+    let filesAtStart = cp.dialogsDone;
     let stageStart = Instant::now();
-    let mut ubuntu = SplitDialogs::at(
-        UbuntuDialogs::withLimit(root, opts.ubuntuFiles, cp.filesDone),
-        cp.dialoguesDone, UBUNTU_HOLDOUT, UBUNTU_HOLDCAP);
-    let status = ubuntu.inner.status.clone();
-    status.chunkStart.set(cp.filesDone);
-    let stats = dialogue::runReplies(
-        &mut ubuntu, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
-        true,
-        TrainLimits { deadline, maxMb: opts.maxMb, ramBudgetMb },
-        Some(&status),
-        LiveOptions { steps: opts.steps, delayMs: opts.delay });
-    cp.train.merge(&stats);
-    cp.filesDone = ubuntu.inner.read;
-    cp.dialoguesDone = ubuntu.counter;
-    println!();
-    printReplyStats("reply (this chunk)", &stats);
-    println!(
-        "files read={} dialogues={} turns={} ({:.1}s)",
-        ubuntu.inner.read, ubuntu.counter, ubuntu.inner.turns,
-        started.elapsed().as_secs_f64());
-
-    // ================= quality on the held out part ========================
-    let held = std::mem::take(&mut ubuntu.held);
-    let mut holdChunk = ReplyStats::default();
-    if !held.is_empty() {
-        let evalStats = dialogue::runReplies(
-            held.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
-            false, TrainLimits::default(), None, LiveOptions::default());
-        cp.holdout.merge(&evalStats);
+    // The range of the session is [start, end). With --repeat the same range
+    // is read again and again: the holdout stays the same every pass, so the
+    // passes can be compared with each other.
+    let rangeStart = cp.dialogsDone;
+    let rangeEnd = if opts.files > 0 { opts.files } else { countDialogs(&corpus) };
+    let counterBase = cp.dialogsSeen;
+    let mut position = rangeStart;
+    let mut counter = counterBase;
+    for pass in 1..=opts.repeat {
+        let mut corpusStream = SplitDialogs::at(
+            MovieDialogs::withLimit(corpus.clone(), rangeEnd, position),
+            counter, MOVIE_HOLDOUT, MOVIE_HOLDCAP);
+        let status = corpusStream.inner.status.clone();
+        status.chunkStart.set(position);
+        let stats = dialogue::runReplies(
+            &mut corpusStream, &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
+            true,
+            TrainLimits { deadline, maxMb: opts.maxMb, ramBudgetMb },
+            Some(&status),
+            LiveOptions { steps: opts.steps, delayMs: opts.delay });
+        cp.train.merge(&stats);
+        let read = corpusStream.inner.read;
+        let seen = corpusStream.counter;
         println!();
-        printReplyStats("reply holdout (this chunk)", &evalStats);
-        holdChunk = evalStats;
+        printReplyStats(&format!("reply (pass {})", pass), &stats);
+        println!(
+            "dialogs read={} seen={} turns={} ({:.1}s)",
+            read, seen, corpusStream.inner.turns, started.elapsed().as_secs_f64());
+
+        // ================= quality on the held out part ====================
+        let held = std::mem::take(&mut corpusStream.held);
+        let mut holdChunk = ReplyStats::default();
+        if !held.is_empty() {
+            let evalStats = dialogue::runReplies(
+                held.iter(), &promptModel, &mut sub, &mut cons, &mut work, &mut focus,
+                false, TrainLimits::default(), None, LiveOptions::default());
+            cp.holdout.merge(&evalStats);
+            println!();
+            printReplyStats(&format!("reply holdout (pass {})", pass), &evalStats);
+            holdChunk = evalStats;
+        }
+        writeSessionRow(
+            opts.log.as_deref(), pass, &stats, &holdChunk, &sub, &cons, &focus,
+            position, read, stageStart.elapsed().as_secs_f64());
+
+        if read < rangeEnd {
+            // the pass was cut short (time or memory): keep the place
+            position = read;
+            counter = seen;
+            break;
+        }
+        position = rangeEnd;
+        counter = seen;
+        if pass < opts.repeat {
+            position = rangeStart;
+            counter = counterBase;
+        }
     }
+    cp.dialogsDone = position;
+    cp.dialogsSeen = counter;
 
     // The vocabulary of the mind is taken from its own tables: no separate
     // frequency map is kept in memory during the run.
@@ -321,7 +396,7 @@ fn main() {
     println!("=== RESULT ===");
     printReplyStats("reply total", &cp.train);
     printReplyStats("reply holdout total", &cp.holdout);
-    println!("files done={} of {}", cp.filesDone, totalFiles);
+    println!("dialogs done={} of {}", cp.dialogsDone, totalDialogs);
     println!(
         "focus final={:.3} fades={} avgConsciousness={:.1}%",
         focus.level(), focus.fades(), focus.avgPercent());
@@ -338,33 +413,11 @@ fn main() {
     println!("forgotten: rows={} features={}", sub.evicted(), cons.evicted());
     {
         let elapsed = stageStart.elapsed().as_secs_f64().max(0.001);
-        let rate = (cp.filesDone.saturating_sub(filesAtStart)) as f64 / elapsed;
-        let remaining = totalFiles.saturating_sub(cp.filesDone);
+        let rate = (cp.dialogsDone.saturating_sub(filesAtStart)) as f64 / elapsed;
+        let remaining = totalDialogs.saturating_sub(cp.dialogsDone);
         let eta = remaining as f64 / rate.max(0.0001);
-        println!("eta to the end of the corpus: {:.0} min ({} files left, {:.0} files/s)",
+        println!("eta to the end of the corpus: {:.0} min ({} dialogs left, {:.0} dialogs/s)",
             eta / 60.0, remaining, rate);
-    }
-
-    // ================= one line per session ================================
-    if let Some(path) = &opts.log {
-        use std::io::Write;
-        let isNew = !Path::new(path).exists();
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            if isNew {
-                let _ = writeln!(f, "filesDone,filesThisSession,stepsThisSession,trainTop1,trainTop3,trainReach,surprisePct,willPct,holdTop1,holdTop3,holdReach,holdSurprisePct,rows,entries,features,edges,rssMb,tablesMb,evictedRows,focusFinal,seconds,features");
-            }
-            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 * 100.0 };
-            let (rows, entries, _) = sub.rowStats();
-            let (feats, edges, _) = cons.edgeStats();
-            let _ = writeln!(f, "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{:.3},{:.0},{}",
-                cp.filesDone, cp.filesDone.saturating_sub(filesAtStart), stats.steps,
-                pct(stats.top1, stats.steps), pct(stats.top3, stats.steps), pct(stats.cand, stats.steps),
-                pct(stats.surprises, stats.steps), pct(stats.wills, stats.steps),
-                pct(holdChunk.top1, holdChunk.steps), pct(holdChunk.top3, holdChunk.steps), pct(holdChunk.cand, holdChunk.steps),
-                pct(holdChunk.surprises, holdChunk.steps), rows, entries, feats, edges,
-                dialogue::residentMb(), dialogue::mindBytes(&sub, &cons) / (1024 * 1024), sub.evicted(),
-                focus.level(), stageStart.elapsed().as_secs_f64(), featureConfig().replace(' ', ";"));
-        }
     }
 
     // ================= checkpoint ===========================================
@@ -373,7 +426,7 @@ fn main() {
             Ok(()) => {
                 let size = std::fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
                 println!();
-                println!("checkpoint saved: {} ({} Mb), files done={}", path, size, cp.filesDone);
+                println!("checkpoint saved: {} ({} Mb), dialogs done={}", path, size, cp.dialogsDone);
                 let _ = std::fs::write(format!("{}.cfg", path), featureConfig());
             }
             Err(err) => println!("cannot save checkpoint {}: {}", path, err),

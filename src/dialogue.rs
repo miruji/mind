@@ -356,7 +356,7 @@ fn corpusProgress(status: Option<&CorpusStatus>, started: Instant) -> String {
     let inChunk = files.saturating_sub(status.chunkStart.get()).max(1);
     let eta = (total.saturating_sub(files)) as f64 / (inChunk as f64 / elapsed);
     format!(
-        " | files {}/{} ({:.1}%), eta {:.0}m",
+        " | dialogs {}/{} ({:.1}%), eta {:.0}m",
         files, total, done, eta / 60.0)
 }
 
